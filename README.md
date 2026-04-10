@@ -1,6 +1,6 @@
-# Disk Operations Tool
+# safepart
 
-`Disk Operations Tool`, Linux sistemlerde disk, partition, filesystem, LVM, mount ve `fstab` işlemlerini daha güvenli şekilde yönetmek için hazırlanmış etkileşimli bir Bash aracıdır.
+`safepart`, Linux sistemlerde disk, partition, filesystem, LVM, mount ve `fstab` işlemlerini daha güvenli şekilde yönetmek için hazırlanmış etkileşimli bir Bash aracıdır.
 
 Script; özellikle aşağıdaki işlerde yardımcı olur:
 
@@ -151,7 +151,7 @@ Opsiyonlar:
 - `--structure normal|lvm` (`normal` = bağımsız partition)
 - `--vg-name vg_data`
 - `--lv-name lv_data`
-- `--backup-file /var/backups/disk-ops/<file>.sfdisk`
+- `--backup-file /var/backups/safepart/<file>.sfdisk`
 
 ## CLI Örnekleri
 
@@ -277,9 +277,9 @@ Bazı sistemlerde loop device üzerinde gerçek partition table uygulaması uyum
 Script aşağıdaki konumları kullanır:
 
 - Log: `/var/log/safepart.log`
-- Partition table yedekleri: `/var/backups/disk-ops`
-- `fstab` yedekleri: `/var/backups/disk-ops/fstab`
-- LVM metadata yedekleri: `/var/backups/disk-ops/lvm`
+- Partition table yedekleri: `/var/backups/safepart`
+- `fstab` yedekleri: `/var/backups/safepart/fstab`
+- LVM metadata yedekleri: `/var/backups/safepart/lvm`
 
 ## Uyarı
 

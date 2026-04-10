@@ -3,7 +3,7 @@ set -u
 set -o pipefail
 
 ###############################################################################
-# Disk Operations Tool
+# safepart
 # v8.0.0
 #
 # Desteklenen işlemler:
@@ -39,9 +39,9 @@ ASSUME_YES=0
 
 LOG_DIR="/var/log"
 LOG_FILE="${LOG_DIR}/safepart.log"
-BACKUP_DIR="/var/backups/disk-ops"
-FSTAB_BACKUP_DIR="/var/backups/disk-ops/fstab"
-LVM_BACKUP_DIR="/var/backups/disk-ops/lvm"
+BACKUP_DIR="/var/backups/safepart"
+FSTAB_BACKUP_DIR="/var/backups/safepart/fstab"
+LVM_BACKUP_DIR="/var/backups/safepart/lvm"
 
 RET_MENU=10
 REPLY_VALUE=""
@@ -85,7 +85,7 @@ Non-interactive action parametreleri:
   --structure normal|lvm
   --vg-name vg_data
   --lv-name lv_data
-  --backup-file /var/backups/disk-ops/sda_20260101_120000.sfdisk
+  --backup-file /var/backups/safepart/sda_20260101_120000.sfdisk
 
 Örnek:
   sudo ./${SCRIPT_NAME} --action create --disk /dev/sdb --size-gb 100 --fs ext4 --mountpoint /data --structure normal --yes
@@ -626,7 +626,7 @@ show_input_help() {
 
 print_banner() {
   divider
-  echo "${C_BOLD}${C_MAGENTA}Disk Operations Tool v${VERSION}${C_RESET}"
+  echo "${C_BOLD}${C_MAGENTA}safepart v${VERSION}${C_RESET}"
   divider
   echo "${C_CYAN}Host${C_RESET}       : $(hostname 2>/dev/null || echo unknown)"
   echo "${C_CYAN}Kernel${C_RESET}     : $(uname -r 2>/dev/null || echo unknown)"
