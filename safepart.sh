@@ -4,7 +4,7 @@ set -o pipefail
 
 ###############################################################################
 # safepart
-# v8.0.0
+# v8.1.0
 #
 # Desteklenen işlemler:
 # - Araç kontrolü
@@ -14,7 +14,8 @@ set -o pipefail
 # - Yeni partition oluşturma
 #   * Bağımsız partition + filesystem + mount + fstab
 #   * LVM (PV + VG + LV + filesystem + mount + fstab)
-# - Bağımsız son partition büyütme + filesystem grow
+# - Partition silme
+# - Bağımsız partition büyütme + filesystem grow
 # - LVM tam zincir büyütme
 #   * PV partition grow -> pvresize -> lvextend -> filesystem grow
 # - Mount kaldırma
@@ -26,13 +27,13 @@ set -o pipefail
 # - xfs
 #
 # Bilinçli sınırlar:
-# - Otomatik partition create/grow yalnızca diskin sonundaki boş alanla çalışır
+# - Otomatik partition create, diskteki uygun boş aralıklarla çalışır; mevcut partition grow ise yalnızca arkasındaki bitişik boş alanı kullanır
 # - LVM zincir büyütmede PV bir partition olmalıdır
 # - RAID / mdadm / multipath / btrfs / zfs / karmaşık crypt topolojileri desteklenmez
 ###############################################################################
 
 SCRIPT_NAME="$(basename "$0")"
-VERSION="8.0.0"
+VERSION="8.1.0"
 
 DRY_RUN=0
 ASSUME_YES=0
@@ -76,7 +77,7 @@ Global parametreler:
   --help
 
 Non-interactive action parametreleri:
-  --action create|grow-part|grow-lvm|backup-pt|restore-pt|reread-pt|unmount|remove-fstab|unmount-clean|health-disk|health-part|selftest
+  --action create|delete-part|grow-part|grow-lvm|backup-pt|restore-pt|reread-pt|unmount|remove-fstab|unmount-clean|health-disk|health-part|selftest
   --disk /dev/sdX
   --target /dev/sdXN | /dev/mapper/vg-lv | /mountpoint
   --size-gb 100
@@ -89,6 +90,7 @@ Non-interactive action parametreleri:
 
 Örnek:
   sudo ./${SCRIPT_NAME} --action create --disk /dev/sdb --size-gb 100 --fs ext4 --mountpoint /data --structure normal --yes
+  sudo ./${SCRIPT_NAME} --action delete-part --target /dev/sdb1 --yes
   sudo ./${SCRIPT_NAME} --action grow-lvm --target /dev/mapper/ubuntu--vg-ubuntu--lv --size-gb 150 --yes
   sudo ./${SCRIPT_NAME} --action health-disk
   sudo ./${SCRIPT_NAME} --action health-part
@@ -173,6 +175,10 @@ log() {
   shift
   local msg="$*"
   printf '%s [%s] %s\n' "$(timestamp)" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+summarize_command_error() {
+  printf '%s\n' "$1" | sed -n '1,3p' | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/[[:space:]]$//'
 }
 
 audit() {
@@ -291,7 +297,7 @@ verify_command_step() {
     xfs_growfs)
       xfs_growfs -n "$@" >/dev/null 2>&1
       ;;
-    lvextend|lvcreate|vgcreate|pvcreate|pvresize)
+    lvextend|lvcreate|vgcreate|vgextend|pvcreate|pvresize)
       "$cmd" -t "$@" >/dev/null 2>&1
       ;;
     resize2fs)
@@ -316,7 +322,7 @@ run_sfdisk_input() {
   local input="$1"
   shift
   local args=("$@")
-  local cmd_string
+  local cmd_string verify_err
 
   cmd_string="printf '%s\n' \"$input\" | sfdisk $(printf '%q ' "${args[@]}")"
   cmd_string="${cmd_string% }"
@@ -329,7 +335,12 @@ run_sfdisk_input() {
 
   echo "[VERIFY] $cmd_string"
   log VERIFY "$cmd_string"
-  printf '%s\n' "$input" | sfdisk --no-act "${args[@]}" >/dev/null 2>&1 || return 1
+  verify_err="$(printf '%s\n' "$input" | sfdisk --no-act "${args[@]}" 2>&1 >/dev/null)" || {
+    verify_err="$(summarize_command_error "$verify_err")"
+    [ -n "$verify_err" ] && warn "sfdisk ön-doğrulama hatası: $verify_err"
+    log ERROR "sfdisk verify failed: ${verify_err:-unknown sfdisk issue}"
+    return 1
+  }
 
   log CMD "$cmd_string"
   printf '%s\n' "$input" | sfdisk "${args[@]}"
@@ -338,7 +349,7 @@ run_sfdisk_input() {
 run_sfdisk_from_file() {
   local disk="$1"
   local backup_file="$2"
-  local cmd_string
+  local cmd_string verify_err
 
   cmd_string="sfdisk $(printf '%q ' "$disk") < $(printf '%q' "$backup_file")"
   cmd_string="${cmd_string% }"
@@ -351,25 +362,80 @@ run_sfdisk_from_file() {
 
   echo "[VERIFY] sfdisk --no-act $(printf '%q ' "$disk")< $(printf '%q' "$backup_file")"
   log VERIFY "$cmd_string"
-  sfdisk --no-act "$disk" < "$backup_file" >/dev/null 2>&1 || return 1
+  verify_err="$(sfdisk --no-act "$disk" < "$backup_file" 2>&1 >/dev/null)" || {
+    verify_err="$(summarize_command_error "$verify_err")"
+    [ -n "$verify_err" ] && warn "sfdisk ön-doğrulama hatası: $verify_err"
+    log ERROR "sfdisk verify failed: ${verify_err:-unknown sfdisk issue}"
+    return 1
+  }
 
   log CMD "$cmd_string"
   sfdisk "$disk" < "$backup_file"
 }
 
+run_parted_disk_command() {
+  local disk="$1"
+  shift
+  local args=("$@")
+  local cmd_string retry_cmd_string cmd_err rc
+
+  cmd_string="parted -s -f $(printf '%q ' "$disk" "${args[@]}")"
+  cmd_string="${cmd_string% }"
+  retry_cmd_string="parted -f $(printf '%q ' "$disk" "${args[@]}") ---pretend-input-tty"
+  retry_cmd_string="${retry_cmd_string% }"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[DRY-RUN] $cmd_string"
+    log DRYRUN "$cmd_string"
+    return 0
+  fi
+
+  log CMD "$cmd_string"
+  cmd_err="$(parted -s -f "$disk" "${args[@]}" 2>&1 >/dev/null)" || {
+    cmd_err="$(summarize_command_error "$cmd_err")"
+    if printf '%s\n' "$cmd_err" | grep -Eqi "Are you sure you want to continue\\?|Do you want to continue\\?|Yes/No\\?"; then
+      warn "parted ek onay istiyor: ${cmd_err:-unknown parted prompt}"
+      confirm "parted uyarısına rağmen devam edilsin mi?"
+      rc=$?
+      if [ "$rc" -ne 0 ]; then
+        warn "parted ek onayı reddedildi. İşlem uygulanmadı."
+        log WARN "parted confirmation declined: ${cmd_err:-unknown parted prompt}"
+        return 1
+      fi
+
+      echo "[VERIFY] $retry_cmd_string"
+      log VERIFY "$retry_cmd_string"
+      cmd_err="$(printf 'Yes\nYes\nYes\nYes\nYes\nYes\n' | parted -f "$disk" "${args[@]}" ---pretend-input-tty 2>&1 >/dev/null)" || {
+        cmd_err="$(summarize_command_error "$cmd_err")"
+        [ -n "$cmd_err" ] && warn "parted hatası: $cmd_err"
+        log ERROR "parted retry with confirmation failed: ${cmd_err:-unknown parted issue}"
+        return 1
+      }
+
+      log CMD "$retry_cmd_string"
+      return 0
+    fi
+
+    [ -n "$cmd_err" ] && warn "parted hatası: $cmd_err"
+    log ERROR "parted command failed: ${cmd_err:-unknown parted issue}"
+    return 1
+  }
+
+  return 0
+}
+
 validate_partition_table_create_plan() {
   local disk="$1"
   local pttype="$2"
+  local parted_label
 
   validation_plan_reset
-  validation_plan_add ok "label create plan prepared: $pttype on $disk"
-
-  printf 'label: %s\n' "$pttype" | sfdisk --no-act "$disk" >/dev/null 2>&1 || {
-    validation_plan_add fail "sfdisk --no-act label validation rejected"
-    warn "Dry-run doğrulaması başarısız: partition table oluşturma planı sfdisk tarafından reddedildi."
+  parted_label="$(get_parted_label_name "$pttype")" || {
+    validation_plan_add fail "unsupported partition table type for parted backend: $pttype"
+    warn "Dry-run doğrulaması başarısız: parted backend bu partition table tipini desteklemiyor."
     return 1
   }
-  validation_plan_add ok "sfdisk --no-act label validation passed"
+  validation_plan_add ok "label create plan prepared for parted backend: $parted_label on $disk"
 
   verify_command_step partx -u "$disk" || {
     validation_plan_add fail "partx reread pre-check failed"
@@ -398,33 +464,51 @@ validate_partition_create_plan() {
   local disk="$1"
   local size_bytes="$2"
   local usage="$3"
-  local pttype type_code disk_free_bytes old_last predicted_part part_spec
+  local pttype disk_free_bytes predicted_part geometry
+  local start_sector end_sector final_bytes chosen_range_bytes
 
   validation_plan_reset
 
   pttype="$(get_pttype "$disk")"
   [ -n "$pttype" ] || return 1
 
-  get_partition_type_code "$pttype" "$usage" || return 1
-  type_code="$REPLY_VALUE"
-
-  get_disk_tail_free_bytes "$disk" || return 1
-  disk_free_bytes="$REPLY_VALUE"
-  [ "$disk_free_bytes" -gt 0 ] || return 1
-
-  if [ "$size_bytes" -gt "$disk_free_bytes" ]; then
-    size_bytes="$disk_free_bytes"
-  fi
-
-  old_last="$(get_last_partition_path_on_disk "$disk" || true)"
-  part_spec="$(build_sfdisk_partition_spec "$disk" "$size_bytes" "$type_code")" || return 1
-
-  printf '%s\n' "$part_spec" | sfdisk --no-act --append "$disk" >/dev/null 2>&1 || {
-    validation_plan_add fail "partition append no-act rejected by sfdisk"
-    warn "Dry-run doğrulaması başarısız: yeni partition create planı sfdisk tarafından reddedildi."
+  get_parted_label_name "$pttype" >/dev/null || {
+    validation_plan_add fail "unsupported partition table type for parted backend: $pttype"
+    warn "Dry-run doğrulaması başarısız: parted backend bu partition table tipini desteklemiyor."
     return 1
   }
-  validation_plan_add ok "partition append no-act accepted by sfdisk"
+  validation_plan_add ok "partition table supported by parted backend: $pttype"
+
+  get_disk_largest_free_bytes "$disk" || return 1
+  disk_free_bytes="$REPLY_VALUE"
+  if [ "$disk_free_bytes" -le 0 ]; then
+    validation_plan_add fail "no allocatable free space available for new partition"
+    warn "Dry-run doğrulaması başarısız: diskte partitionlanabilir boş alan bulunamadı."
+    return 1
+  fi
+  validation_plan_add ok "largest allocatable free range detected: $(bytes_to_human "$disk_free_bytes")"
+
+  verify_parted_disk_query "$disk" || {
+    validation_plan_add fail "parted disk query failed"
+    warn "Dry-run doğrulaması başarısız: parted disk sorgusu başarısız oldu."
+    return 1
+  }
+  validation_plan_add ok "parted disk query passed"
+
+  calculate_partition_create_geometry "$disk" "$size_bytes" || {
+    validation_plan_add fail "partition create geometry could not be calculated"
+    warn "Dry-run doğrulaması başarısız: yeni partition geometrisi hesaplanamadı."
+    return 1
+  }
+  geometry="$REPLY_VALUE"
+  IFS=: read -r start_sector end_sector final_bytes chosen_range_bytes <<EOF
+$geometry
+EOF
+
+  if [ "$final_bytes" -lt "$size_bytes" ]; then
+    validation_plan_add warn "requested size exceeds selected free range; backend will clamp to $(bytes_to_human "$final_bytes")"
+  fi
+  validation_plan_add ok "create geometry prepared: start=${start_sector}s end=${end_sector}s size=$(bytes_to_human "$final_bytes") range=$(bytes_to_human "$chosen_range_bytes")"
 
   verify_command_step partx -u "$disk" || {
     validation_plan_add fail "partx reread pre-check failed"
@@ -433,7 +517,7 @@ validate_partition_create_plan() {
   }
   validation_plan_add ok "kernel reread pre-check passed"
 
-  predicted_part="$(predict_next_partition_path "$disk" "$old_last")" || return 1
+  predicted_part="$(predict_next_partition_path "$disk")" || return 1
   validation_plan_add ok "predicted new partition path: $predicted_part"
   REPLY_VALUE="$predicted_part"
   return 0
@@ -566,6 +650,35 @@ validate_lvm_create_plan() {
   return 0
 }
 
+validate_lvm_pvcreate_plan() {
+  local pv="$1"
+
+  validation_plan_reset
+
+  verify_command_step pvcreate "$pv" || {
+    validation_plan_add fail "pvcreate test mode failed"
+    warn "Dry-run doğrulaması başarısız: pvcreate test modu başarısız oldu."
+    return 1
+  }
+  validation_plan_add ok "pvcreate test mode passed"
+  return 0
+}
+
+validate_lvm_vgextend_plan() {
+  local vg_name="$1"
+  local pv="$2"
+
+  validation_plan_reset
+
+  verify_command_step vgextend "$vg_name" "$pv" || {
+    validation_plan_add fail "vgextend test mode failed"
+    warn "Dry-run doğrulaması başarısız: vgextend test modu başarısız oldu."
+    return 1
+  }
+  validation_plan_add ok "vgextend test mode passed"
+  return 0
+}
+
 validate_restore_partition_table_plan() {
   local disk="$1"
   local backup_file="$2"
@@ -586,6 +699,50 @@ validate_restore_partition_table_plan() {
   }
   validation_plan_add ok "kernel reread pre-check passed"
 
+  return 0
+}
+
+validate_partition_delete_plan() {
+  local part="$1"
+  local disk partnum
+
+  validation_plan_reset
+
+  [ -b "$part" ] || {
+    validation_plan_add fail "target partition path is not a block device"
+    warn "Dry-run doğrulaması başarısız: hedef geçerli bir block device değil."
+    return 1
+  }
+  validation_plan_add ok "target partition device exists: $part"
+
+  disk="$(get_parent_disk "$part")" || {
+    validation_plan_add fail "parent disk could not be resolved"
+    warn "Dry-run doğrulaması başarısız: parent disk bulunamadı."
+    return 1
+  }
+  partnum="$(get_partnum "$part")"
+  [ -n "$partnum" ] || {
+    validation_plan_add fail "partition number could not be resolved"
+    warn "Dry-run doğrulaması başarısız: partition numarası okunamadı."
+    return 1
+  }
+  validation_plan_add ok "delete target resolved: disk=$disk partnum=$partnum"
+
+  verify_parted_disk_query "$disk" || {
+    validation_plan_add fail "parted disk query failed"
+    warn "Dry-run doğrulaması başarısız: parted disk sorgusu başarısız oldu."
+    return 1
+  }
+  validation_plan_add ok "parted disk query passed"
+
+  verify_command_step partx -u "$disk" || {
+    validation_plan_add fail "kernel reread pre-check failed"
+    warn "Dry-run doğrulaması başarısız: kernel reread ön-koşul kontrolü geçmedi."
+    return 1
+  }
+  validation_plan_add ok "kernel reread pre-check passed"
+
+  REPLY_VALUE="$partnum"
   return 0
 }
 
@@ -824,13 +981,13 @@ get_required_packages() {
   local mgr="$1"
   case "$mgr" in
     apt)
-      REPLY_VALUE="util-linux e2fsprogs xfsprogs lvm2 gawk grep sed coreutils procps mount psmisc smartmontools"
+      REPLY_VALUE="util-linux parted e2fsprogs xfsprogs lvm2 gawk grep sed coreutils procps mount psmisc smartmontools"
       ;;
     dnf|yum)
-      REPLY_VALUE="util-linux e2fsprogs xfsprogs lvm2 gawk grep sed coreutils procps-ng psmisc lsof smartmontools"
+      REPLY_VALUE="util-linux parted e2fsprogs xfsprogs lvm2 gawk grep sed coreutils procps-ng psmisc lsof smartmontools"
       ;;
     zypper)
-      REPLY_VALUE="util-linux e2fsprogs xfsprogs lvm2 gawk grep sed coreutils procps psmisc lsof smartmontools"
+      REPLY_VALUE="util-linux parted e2fsprogs xfsprogs lvm2 gawk grep sed coreutils procps psmisc lsof smartmontools"
       ;;
     *)
       return 1
@@ -898,7 +1055,7 @@ install_required_tools() {
 ###############################################################################
 
 CORE_TOOLS=(
-  bash lsblk blockdev sfdisk partx findmnt df awk sed grep cat date hostname uname
+  bash lsblk blockdev sfdisk parted partx findmnt df awk sed grep cat date hostname uname
   blkid mount umount mountpoint mkdir cp mktemp losetup truncate rm sync dd
 )
 
@@ -907,7 +1064,7 @@ FS_TOOLS=(
 )
 
 LVM_TOOLS=(
-  pvs vgs lvs lvdisplay lvextend lvcreate vgcreate pvdisplay pvresize pvcreate vgcfgbackup
+  pvs vgs lvs lvdisplay lvextend lvcreate vgcreate vgextend pvdisplay pvresize pvcreate vgcfgbackup
 )
 
 OPTIONAL_TOOLS=(
@@ -1373,7 +1530,7 @@ show_partition_health() {
 
 run_loopback_test_lab() {
   local workdir image loopdev target_dev mount_dir
-  local sfdisk_err lab_part_spec
+  local parted_err
   cleanup_loopback_lab() {
     mountpoint -q "$mount_dir" 2>/dev/null && umount "$mount_dir" >/dev/null 2>&1 || true
     [ -n "$loopdev" ] && losetup -d "$loopdev" >/dev/null 2>&1 || true
@@ -1388,7 +1545,7 @@ run_loopback_test_lab() {
   echo "Açıklama: Gerçek diskleri etkilemeden geçici bir loop device üzerinde create/grow akışlarını test eder."
   echo
 
-  local selftest_tools=(losetup sfdisk mkfs.ext4 mount umount mountpoint dd)
+  local selftest_tools=(losetup parted mkfs.ext4 mount umount mountpoint dd)
   local missing_tools=() tool
   for tool in "${selftest_tools[@]}"; do
     cmd_exists "$tool" || missing_tools+=("$tool")
@@ -1419,16 +1576,11 @@ run_loopback_test_lab() {
   }
   validation_plan_add ok "loop device attached: $loopdev"
 
-  lab_part_spec="$(build_sfdisk_partition_spec "$loopdev" $((128 * 1024 * 1024)) 8300)" || {
-    cleanup_loopback_lab
-    fatal "Loopback test partition spec oluşturulamadı."
-  }
-
-  if sfdisk_err="$(printf 'label: gpt\n%s\n' "$lab_part_spec" | sfdisk --no-act "$loopdev" 2>&1 >/dev/null)"; then
-    validation_plan_add ok "partition table create syntax validated on loop device"
+  if parted_err="$(parted -s -f "$loopdev" unit s mklabel gpt mkpart lab ext4 2048s 264191s 2>&1 >/dev/null)"; then
+    validation_plan_add ok "parted create flow validated on loop device"
   else
-    sfdisk_err="$(printf '%s\n' "$sfdisk_err" | sed -n '1,3p' | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/[[:space:]]$//')"
-    validation_plan_add warn "partition table validation skipped details: ${sfdisk_err:-unknown sfdisk issue}"
+    parted_err="$(summarize_command_error "$parted_err")"
+    validation_plan_add warn "parted create flow validation skipped details: ${parted_err:-unknown parted issue}"
   fi
 
   target_dev="$loopdev"
@@ -1566,6 +1718,25 @@ list_vg_pvs() {
   echo
 }
 
+list_disks_with_allocatable_free_space() {
+  local exclude_disk="${1:-}"
+  local i=1
+  local disk size model free_bytes
+
+  title "Boş alanı olan diskler"
+  echo "Açıklama: Yeni PV oluşturmak için partitionlanabilir boş alan görünen diskleri gösterir."
+  [ -n "$exclude_disk" ] && echo "Hariç tutulan disk: $exclude_disk"
+  echo
+
+  while IFS='|' read -r disk size model free_bytes; do
+    [ -n "$disk" ] || continue
+    printf "  ${C_CYAN}%2d)${C_RESET} %-16s %-10s free=%-10s %s\n" \
+      "$i" "$disk" "$size" "$(bytes_to_human "$free_bytes")" "${model:--}"
+    i=$((i + 1))
+  done < <(get_disks_with_allocatable_free_space "$exclude_disk")
+  echo
+}
+
 get_mounted_targets_list() {
   findmnt -rno TARGET,SOURCE,FSTYPE | awk '{print $1 "|" $2 "|" $3}'
 }
@@ -1627,6 +1798,34 @@ get_mountpoint() {
   lsblk -no MOUNTPOINT "$1" 2>/dev/null | head -n1 | awk '{$1=$1;print}'
 }
 
+is_lvm_pv() {
+  pvs "$1" >/dev/null 2>&1
+}
+
+is_active_swap() {
+  awk -v dev="$1" 'NR > 1 && $1 == dev { found=1; exit } END { exit(found ? 0 : 1) }' /proc/swaps 2>/dev/null
+}
+
+get_fstab_mountpoints_for_device() {
+  local dev="$1"
+  local uuid
+
+  uuid="$(get_uuid_of_device "$dev" || true)"
+
+  awk -v d="$dev" -v u="$uuid" '
+    $0 !~ /^[[:space:]]*#/ && NF >= 2 {
+      spec=$1
+      mp=$2
+      if (spec == d || (u != "" && spec == "UUID=" u)) print mp
+    }' /etc/fstab 2>/dev/null | awk '!seen[$0]++'
+}
+
+get_block_dependents() {
+  local dev="$1"
+  lsblk -nrpo PATH,TYPE "$dev" 2>/dev/null | awk -v d="$dev" '
+    NR > 1 && $1 != d { print $1 "|" $2 }'
+}
+
 get_pttype() {
   lsblk -no PTTYPE "$1" 2>/dev/null | head -n1 | awk '{$1=$1;print}'
 }
@@ -1635,10 +1834,35 @@ get_disk_basename() {
   basename "$1"
 }
 
+get_parted_label_name() {
+  case "$1" in
+    gpt) echo "gpt" ;;
+    dos|msdos) echo "msdos" ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+verify_parted_disk_query() {
+  parted -m -s "$1" unit s print free >/dev/null 2>&1
+}
+
 get_sfdisk_line() {
   local disk="$1"
   local part="$2"
   sfdisk -d "$disk" 2>/dev/null | awk -v p="$part" '$1==p {print}'
+}
+
+get_sfdisk_header_value() {
+  local dump="$1"
+  local key="$2"
+  printf '%s\n' "$dump" | awk -F: -v k="$key" '
+    $1 == k {
+      sub(/^[^:]*:[[:space:]]*/, "", $0)
+      print
+      exit
+    }'
 }
 
 get_start_sector_from_line() {
@@ -1647,6 +1871,247 @@ get_start_sector_from_line() {
 
 get_size_sector_from_line() {
   echo "$1" | sed -n 's/.*size=[[:space:]]*\([0-9][0-9]*\).*/\1/p'
+}
+
+get_partitionable_end_sector_limit() {
+  local disk="$1"
+  local dump pttype last_lba sector_size disk_bytes total_sectors
+
+  dump="$(sfdisk -d "$disk" 2>/dev/null)" || return 1
+  pttype="$(get_sfdisk_header_value "$dump" "label")"
+
+  if [ "$pttype" = "gpt" ]; then
+    last_lba="$(get_sfdisk_header_value "$dump" "last-lba")"
+    if [ -n "$last_lba" ]; then
+      REPLY_VALUE=$((last_lba + 1))
+      return 0
+    fi
+  fi
+
+  sector_size="$(blockdev --getss "$disk" 2>/dev/null)" || return 1
+  disk_bytes="$(blockdev --getsize64 "$disk" 2>/dev/null)" || return 1
+  total_sectors=$((disk_bytes / sector_size))
+
+  if [ "$pttype" = "gpt" ] && [ "$total_sectors" -gt 33 ]; then
+    REPLY_VALUE=$((total_sectors - 33))
+  else
+    REPLY_VALUE="$total_sectors"
+  fi
+  return 0
+}
+
+get_partition_growth_limit_sector() {
+  local disk="$1"
+  local part="$2"
+  local sfdisk_line start_sector current_sectors part_end_sector disk_limit_sector
+  local next_start line candidate_start candidate_path
+
+  sfdisk_line="$(get_sfdisk_line "$disk" "$part")" || return 1
+  [ -n "$sfdisk_line" ] || return 1
+
+  start_sector="$(get_start_sector_from_line "$sfdisk_line")"
+  current_sectors="$(get_size_sector_from_line "$sfdisk_line")"
+  [ -n "$start_sector" ] || return 1
+  [ -n "$current_sectors" ] || return 1
+
+  part_end_sector=$((start_sector + current_sectors))
+  get_partitionable_end_sector_limit "$disk" || return 1
+  disk_limit_sector="$REPLY_VALUE"
+
+  next_start=""
+  while IFS= read -r line; do
+    case "$line" in
+      /dev/*)
+        candidate_path="$(echo "$line" | awk '{print $1}')"
+        [ "$candidate_path" = "$part" ] && continue
+        candidate_start="$(get_start_sector_from_line "$line")"
+        [ -n "$candidate_start" ] || continue
+        if [ "$candidate_start" -ge "$part_end_sector" ]; then
+          if [ -z "$next_start" ] || [ "$candidate_start" -lt "$next_start" ]; then
+            next_start="$candidate_start"
+          fi
+        fi
+        ;;
+    esac
+  done < <(sfdisk -d "$disk" 2>/dev/null)
+
+  if [ -n "$next_start" ] && [ "$next_start" -lt "$disk_limit_sector" ]; then
+    REPLY_VALUE="$next_start"
+  else
+    REPLY_VALUE="$disk_limit_sector"
+  fi
+  return 0
+}
+
+list_disk_free_ranges() {
+  parted -m -s "$1" unit s print free 2>/dev/null | awk -F: '
+    /:free;$/ {
+      start=$2
+      end=$3
+      sub(/[^0-9].*$/, "", start)
+      sub(/[^0-9].*$/, "", end)
+      if (start != "" && end != "" && end >= start) print start ":" end
+    }'
+}
+
+get_disk_largest_free_range() {
+  local disk="$1"
+  local range start_sector end_sector sectors best_start best_end best_sectors=0
+
+  while IFS= read -r range; do
+    [ -n "$range" ] || continue
+    start_sector="${range%%:*}"
+    end_sector="${range##*:}"
+    sectors=$(((end_sector - start_sector) + 1))
+    if [ "$sectors" -gt "$best_sectors" ]; then
+      best_sectors="$sectors"
+      best_start="$start_sector"
+      best_end="$end_sector"
+    fi
+  done < <(list_disk_free_ranges "$disk")
+
+  [ "$best_sectors" -gt 0 ] || return 1
+  REPLY_VALUE="${best_start}:${best_end}"
+  return 0
+}
+
+get_disk_largest_free_bytes() {
+  local disk="$1"
+  local sector_size range start_sector end_sector
+
+  sector_size="$(blockdev --getss "$disk" 2>/dev/null)" || return 1
+  get_disk_largest_free_range "$disk" || return 1
+  range="$REPLY_VALUE"
+  start_sector="${range%%:*}"
+  end_sector="${range##*:}"
+
+  REPLY_VALUE=$((((end_sector - start_sector) + 1) * sector_size))
+  [ "$REPLY_VALUE" -lt 0 ] && REPLY_VALUE=0
+  return 0
+}
+
+get_disk_free_ranges_report() {
+  local disk="$1"
+  local sector_size range start_sector end_sector range_bytes
+
+  sector_size="$(blockdev --getss "$disk" 2>/dev/null)" || return 1
+
+  while IFS= read -r range; do
+    [ -n "$range" ] || continue
+    start_sector="${range%%:*}"
+    end_sector="${range##*:}"
+    range_bytes=$((((end_sector - start_sector) + 1) * sector_size))
+    [ "$range_bytes" -gt 0 ] || continue
+    printf '%s|%s|%s\n' "$start_sector" "$end_sector" "$(bytes_to_human "$range_bytes")"
+  done < <(list_disk_free_ranges "$disk")
+}
+
+show_disk_free_ranges() {
+  local disk="$1"
+  local shown=0 start_sector end_sector size_human
+
+  echo "  Partitionlanabilir boş aralıklar:"
+  while IFS='|' read -r start_sector end_sector size_human; do
+    [ -n "$start_sector" ] || continue
+    printf '    - %ss -> %ss (%s)\n' "$start_sector" "$end_sector" "$size_human"
+    shown=1
+  done < <(get_disk_free_ranges_report "$disk")
+
+  if [ "$shown" -eq 0 ]; then
+    echo "    - yok"
+  fi
+}
+
+get_disks_with_allocatable_free_space() {
+  local exclude_disk="${1:-}"
+  local disk size model free_bytes
+
+  while IFS='|' read -r disk size model; do
+    [ -n "$disk" ] || continue
+    if [ -n "$exclude_disk" ] && [ "$disk" = "$exclude_disk" ]; then
+      continue
+    fi
+    get_disk_largest_free_bytes "$disk" || continue
+    free_bytes="$REPLY_VALUE"
+    [ "$free_bytes" -gt 0 ] || continue
+    printf '%s|%s|%s|%s\n' "$disk" "$size" "$model" "$free_bytes"
+  done < <(get_disk_list)
+}
+
+get_disk_tail_free_range() {
+  local disk="$1"
+  local parted_out free_line start_sector end_sector usable_last_sector
+
+  parted_out="$(parted -m -s "$disk" unit s print free 2>/dev/null)" || return 1
+  free_line="$(printf '%s\n' "$parted_out" | awk -F: '/:free;$/ { last = $0 } END { print last }')"
+  [ -n "$free_line" ] || return 1
+
+  start_sector="$(printf '%s\n' "$free_line" | awk -F: '{print $2}' | sed -E 's/[^0-9].*$//')"
+  end_sector="$(printf '%s\n' "$free_line" | awk -F: '{print $3}' | sed -E 's/[^0-9].*$//')"
+  [ -n "$start_sector" ] || return 1
+  [ -n "$end_sector" ] || return 1
+
+  get_partitionable_end_sector_limit "$disk" || return 1
+  usable_last_sector=$((REPLY_VALUE - 1))
+  [ "$end_sector" -eq "$usable_last_sector" ] || return 1
+
+  REPLY_VALUE="${start_sector}:${end_sector}"
+  return 0
+}
+
+calculate_partition_create_geometry() {
+  local disk="$1"
+  local requested_bytes="$2"
+  local sector_size range start_sector end_sector range_sectors chosen_range_sectors
+  local requested_sectors final_bytes final_sectors final_end_sector
+  local best_start="" best_end="" best_sectors=0
+  local fallback_start="" fallback_end="" fallback_sectors=0
+
+  sector_size="$(blockdev --getss "$disk" 2>/dev/null)" || return 1
+  requested_sectors=$((requested_bytes / sector_size))
+  [ "$requested_sectors" -gt 0 ] || return 1
+
+  while IFS= read -r range; do
+    [ -n "$range" ] || continue
+    start_sector="${range%%:*}"
+    end_sector="${range##*:}"
+    range_sectors=$(((end_sector - start_sector) + 1))
+    [ "$range_sectors" -gt 0 ] || continue
+
+    if [ "$range_sectors" -gt "$fallback_sectors" ]; then
+      fallback_start="$start_sector"
+      fallback_end="$end_sector"
+      fallback_sectors="$range_sectors"
+    fi
+
+    if [ "$range_sectors" -ge "$requested_sectors" ]; then
+      if [ "$best_sectors" -eq 0 ] || [ "$range_sectors" -lt "$best_sectors" ]; then
+        best_start="$start_sector"
+        best_end="$end_sector"
+        best_sectors="$range_sectors"
+      fi
+    fi
+  done < <(list_disk_free_ranges "$disk")
+
+  if [ "$best_sectors" -gt 0 ]; then
+    start_sector="$best_start"
+    end_sector="$best_end"
+    chosen_range_sectors="$best_sectors"
+    final_sectors="$requested_sectors"
+  else
+    [ "$fallback_sectors" -gt 0 ] || return 1
+    start_sector="$fallback_start"
+    end_sector="$fallback_end"
+    chosen_range_sectors="$fallback_sectors"
+    final_sectors="$fallback_sectors"
+  fi
+
+  final_end_sector=$((start_sector + final_sectors - 1))
+  [ "$final_end_sector" -le "$end_sector" ] || final_end_sector="$end_sector"
+  final_bytes=$((((final_end_sector - start_sector) + 1) * sector_size))
+
+  REPLY_VALUE="${start_sector}:${final_end_sector}:${final_bytes}:$((chosen_range_sectors * sector_size))"
+  return 0
 }
 
 get_last_partition_path_on_disk() {
@@ -1663,18 +2128,50 @@ get_last_partition_path_on_disk() {
     }'
 }
 
+get_partition_paths_on_disk() {
+  local disk="$1"
+  local disk_base
+  disk_base="$(get_disk_basename "$disk")"
+
+  lsblk -rno PATH,PKNAME,TYPE 2>/dev/null | awk -v d="$disk_base" '
+    $2 == d && $3 == "part" { print $1 }'
+}
+
+get_next_available_partnum() {
+  local disk="$1"
+  local disk_base
+  disk_base="$(get_disk_basename "$disk")"
+
+  lsblk -rno PKNAME,PARTN,TYPE 2>/dev/null | awk -v d="$disk_base" '
+    $1 == d && $3 == "part" && $2 ~ /^[0-9]+$/ { used[$2] = 1 }
+    END {
+      n = 1
+      while (used[n]) n++
+      print n
+    }'
+}
+
+find_new_partition_path_on_disk() {
+  local disk="$1"
+  local before_paths="$2"
+  local path
+
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    if ! printf '%s\n' "$before_paths" | grep -Fxq "$path"; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+  done < <(get_partition_paths_on_disk "$disk")
+
+  return 1
+}
+
 predict_next_partition_path() {
   local disk="$1"
-  local last_part="$2"
   local next_num
-
-  if [ -n "$last_part" ]; then
-    next_num="$(get_partnum "$last_part")"
-    [ -n "$next_num" ] || return 1
-    next_num=$((next_num + 1))
-  else
-    next_num=1
-  fi
+  next_num="$(get_next_available_partnum "$disk")"
+  [ -n "$next_num" ] || return 1
 
   case "$disk" in
     *[0-9]) printf '%sp%s\n' "$disk" "$next_num" ;;
@@ -1684,26 +2181,15 @@ predict_next_partition_path() {
 
 get_disk_tail_free_bytes() {
   local disk="$1"
-  local disk_bytes sector_size max_end end start size line
+  local sector_size range start_sector end_sector
 
-  disk_bytes="$(blockdev --getsize64 "$disk" 2>/dev/null)" || return 1
   sector_size="$(blockdev --getss "$disk" 2>/dev/null)" || return 1
+  get_disk_tail_free_range "$disk" || return 1
+  range="$REPLY_VALUE"
+  start_sector="${range%%:*}"
+  end_sector="${range##*:}"
 
-  max_end=0
-  while IFS= read -r line; do
-    case "$line" in
-      /dev/*)
-        start="$(get_start_sector_from_line "$line")"
-        size="$(get_size_sector_from_line "$line")"
-        [ -n "$start" ] || continue
-        [ -n "$size" ] || continue
-        end=$((start + size))
-        [ "$end" -gt "$max_end" ] && max_end="$end"
-        ;;
-    esac
-  done < <(sfdisk -d "$disk" 2>/dev/null)
-
-  REPLY_VALUE="$((disk_bytes - (max_end * sector_size)))"
+  REPLY_VALUE=$((((end_sector - start_sector) + 1) * sector_size))
   [ "$REPLY_VALUE" -lt 0 ] && REPLY_VALUE=0
   return 0
 }
@@ -1804,7 +2290,7 @@ preflight_report() {
     grow-part)
       echo "  Adımlar:"
       echo "    1) Partition table backup"
-      echo "    2) Son partition grow"
+      echo "    2) Partition grow (arkasındaki bitişik boş alan kadar)"
       echo "    3) Kernel reread denemesi"
       echo "    4) Filesystem grow"
       ;;
@@ -1816,6 +2302,18 @@ preflight_report() {
       echo "    4) pvresize"
       echo "    5) lvextend"
       echo "    6) Filesystem grow"
+      ;;
+    delete-part)
+      echo "  Adımlar:"
+      echo "    1) Gerekirse mount kullanım kontrolü"
+      echo "    2) Gerekirse unmount"
+      echo "    3) Gerekirse fstab backup + entry removal"
+      echo "    4) Partition table backup"
+      echo "    5) Partition delete"
+      echo "    6) Kernel reread denemesi"
+      echo "  Risk:"
+      echo "    - Partition içeriği geri alınmaz."
+      echo "    - LVM PV, aktif swap ve bağımlı child device içeren yapıların silinmesi desteklenmez."
       ;;
     restore-pt)
       echo "  Risk:"
@@ -2155,6 +2653,36 @@ resolve_disk_selection() {
   return 0
 }
 
+resolve_allocatable_disk_selection() {
+  local exclude_disk="$1"
+  local input="$2"
+  local index=1
+  local disk size model free_bytes selected_disk
+
+  if echo "$input" | grep -Eq '^[0-9]+$'; then
+    while IFS='|' read -r disk size model free_bytes; do
+      [ -n "$disk" ] || continue
+      if [ "$index" -eq "$input" ]; then
+        REPLY_VALUE="$disk"
+        return 0
+      fi
+      index=$((index + 1))
+    done < <(get_disks_with_allocatable_free_space "$exclude_disk")
+    return 1
+  fi
+
+  resolve_disk_selection "$input" || return 1
+  selected_disk="$REPLY_VALUE"
+  if [ -n "$exclude_disk" ] && [ "$selected_disk" = "$exclude_disk" ]; then
+    return 1
+  fi
+
+  get_disk_largest_free_bytes "$selected_disk" || return 1
+  [ "$REPLY_VALUE" -gt 0 ] || return 1
+  REPLY_VALUE="$selected_disk"
+  return 0
+}
+
 resolve_fstab_selection() {
   local input="$1"
   local index=1
@@ -2385,6 +2913,26 @@ select_disk_for_generic_ops() {
       return 0
     fi
     warn "Hatalı değer girildi. Geçerli bir disk numarası veya disk yolu girin."
+  done
+}
+
+select_disk_with_allocatable_free_space() {
+  local exclude_disk="${1:-}"
+  local input
+
+  while true; do
+    list_disks_with_allocatable_free_space "$exclude_disk"
+    echo "Seçim yöntemi: listedeki numarayı veya doğrudan disk yolunu girin."
+    ask_nonempty "Yeni PV için disk seçimi"
+    case $? in
+      "$RET_MENU") return "$RET_MENU" ;;
+      0) input="$REPLY_VALUE" ;;
+    esac
+
+    if resolve_allocatable_disk_selection "$exclude_disk" "$input"; then
+      return 0
+    fi
+    warn "Hatalı değer girildi. Partitionlanabilir boş alanı olan geçerli bir disk seçin."
   done
 }
 
@@ -2749,13 +3297,167 @@ reread_partition_table() {
   audit "reread-pt disk=$disk"
 }
 
+delete_partition_by_device() {
+  local part="$1"
+  local disk partnum
+
+  disk="$(get_parent_disk "$part")" || fatal "Parent disk bulunamadı."
+  partnum="$(get_partnum "$part")"
+  [ -n "$partnum" ] || fatal "Partition numarası bulunamadı."
+
+  info "Partition siliniyor..."
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[DRY-RUN] parted -s -f '$disk' rm '$partnum'"
+  else
+    run_parted_disk_command "$disk" rm "$partnum" || fatal "Partition silinemedi."
+  fi
+
+  info "Kernel'e yeni partition bilgisi okutuluyor..."
+  run_cmd partx -u "$disk" || warn "Kernel yeni partition bilgisini hemen okuyamadı. Reboot gerekebilir."
+
+  REPLY_VALUE="$disk"
+  return 0
+}
+
+delete_partition_flow() {
+  local part disk partnum fstype mnt size_human rc
+  local dependent_blocks fstab_mountpoints fstab_mp
+
+  title "Partition silme"
+  echo "Açıklama: Seçilen partition'ı güvenlik kontrolleriyle siler."
+  echo "Aktif mount, fstab kaydı veya bağımlı katman varsa önce bunlar ele alınır."
+  echo
+
+  if [ -n "$CLI_TARGET" ]; then
+    part="$CLI_TARGET"
+    resolve_partition_selection "$part" || fatal "Geçersiz partition: $part"
+    part="$REPLY_VALUE"
+  else
+    select_partition_for_ops
+    rc=$?
+    [ "$rc" -eq "$RET_MENU" ] && return 0
+    part="$REPLY_VALUE"
+  fi
+
+  disk="$(get_parent_disk "$part")" || fatal "Parent disk bulunamadı."
+  partnum="$(get_partnum "$part")"
+  [ -n "$partnum" ] || fatal "Partition numarası bulunamadı."
+  fstype="$(get_fstype "$part")"
+  mnt="$(get_mountpoint "$part")"
+  size_human="$(lsblk -no SIZE "$part" 2>/dev/null | head -n1 | awk '{$1=$1;print}')"
+
+  echo "  Partition     : $part"
+  echo "  Disk          : $disk"
+  echo "  Part num      : $partnum"
+  echo "  Boyut         : ${size_human:--}"
+  echo "  Filesystem    : ${fstype:--}"
+  echo "  Mountpoint    : ${mnt:--}"
+  echo
+
+  preflight_report "delete-part" "$part" "$disk" "$fstype" "$mnt"
+
+  detect_unsupported_topology "$part" && fatal "Desteklenmeyen topoloji: $REPLY_VALUE"
+  case "$fstype" in
+    crypto_LUKS|linux_raid_member|LVM2_member)
+      fatal "Bu partition özel bir üye imzası taşıyor ($fstype). Otomatik silme yerine ilgili üst katman güvenli şekilde kapatılmalı."
+      ;;
+  esac
+
+  dependent_blocks="$(get_block_dependents "$part" || true)"
+  if [ -n "$dependent_blocks" ]; then
+    warn "Partition altında bağımlı block device'lar tespit edildi:"
+    while IFS='|' read -r dep_path dep_type; do
+      [ -n "$dep_path" ] || continue
+      echo "  - $dep_path (${dep_type:--})"
+    done <<EOF
+$dependent_blocks
+EOF
+    fatal "Bağımlı aygıtlar varken otomatik partition silme desteklenmez."
+  fi
+
+  if is_lvm_pv "$part"; then
+    fatal "Seçilen partition bir LVM PV olarak kullanılıyor. Önce vg/pv yapısından güvenli şekilde çıkarılmalı."
+  fi
+
+  if is_active_swap "$part"; then
+    fatal "Seçilen partition aktif swap olarak kullanılıyor. Bu script swapoff + silme zincirini otomatik yapmıyor."
+  fi
+
+  case "$mnt" in
+    /|/boot|/boot/efi|/var|/usr|/home|/opt)
+      fatal "Kritik mountpoint kullanan partition'lar için otomatik silme desteklenmez: $mnt"
+      ;;
+  esac
+
+  if [ -n "$mnt" ] && mountpoint -q "$mnt" 2>/dev/null; then
+    show_mount_usage "$mnt"
+    confirm "$mnt şu anda mount edilmiş. Partition silmeden önce unmount edilsin mi?"
+    rc=$?
+    [ "$rc" -eq "$RET_MENU" ] && return 0
+    [ "$rc" -ne 0 ] && return 1
+    run_cmd umount "$mnt" || fatal "umount başarısız oldu: $mnt"
+  fi
+
+  fstab_mountpoints="$(get_fstab_mountpoints_for_device "$part" || true)"
+  if [ -n "$fstab_mountpoints" ]; then
+    echo
+    warn "Bu partition için /etc/fstab kayıtları bulundu:"
+    while IFS= read -r fstab_mp; do
+      [ -n "$fstab_mp" ] || continue
+      echo "  - $fstab_mp"
+      critical_mount_extra_confirm "$fstab_mp"
+      rc=$?
+      [ "$rc" -eq "$RET_MENU" ] && return 0
+      [ "$rc" -ne 0 ] && return 1
+    done <<EOF
+$fstab_mountpoints
+EOF
+
+    confirm "Partition silinmeden önce bu /etc/fstab kayıtları kaldırılsın mı?"
+    rc=$?
+    [ "$rc" -eq "$RET_MENU" ] && return 0
+    [ "$rc" -ne 0 ] && fatal "fstab kayıtları bırakılarak partition silme yapılmadı."
+
+    while IFS= read -r fstab_mp; do
+      [ -n "$fstab_mp" ] || continue
+      remove_fstab_entry_by_mountpoint "$fstab_mp"
+    done <<EOF
+$fstab_mountpoints
+EOF
+  fi
+
+  confirm "$disk için önce partition table yedeği alınsın mı?"
+  rc=$?
+  [ "$rc" -eq "$RET_MENU" ] && return 0
+  [ "$rc" -ne 0 ] && fatal "Yedek alınmadan devam edilmedi."
+
+  backup_partition_table "$disk" 1 || fatal "Partition table yedeği alınamadı."
+
+  validate_partition_delete_plan "$part" || return 1
+  partnum="$REPLY_VALUE"
+  show_action_validation_result "Partition silme" "$part" "disk=$disk partnum=$partnum" || return 1
+
+  confirm "Dry-run başarılı. $part silinsin mi?"
+  rc=$?
+  [ "$rc" -eq "$RET_MENU" ] && return 0
+  [ "$rc" -ne 0 ] && return 1
+
+  delete_partition_by_device "$part"
+
+  ok "Partition silme işlemi tamamlandı."
+  echo "  Partition     : $part"
+  echo "  Disk          : $disk"
+  echo
+  audit "delete-part part=$part disk=$disk partnum=$partnum fs=${fstype:--} mountpoint=${mnt:--}"
+}
+
 ###############################################################################
 # Partition create helpers
 ###############################################################################
 
 ensure_partition_table_exists() {
   local disk="$1"
-  local pttype rc choice
+  local pttype rc choice parted_label
 
   pttype="$(get_pttype "$disk")"
 
@@ -2787,10 +3489,11 @@ ensure_partition_table_exists() {
   [ "$rc" -eq "$RET_MENU" ] && return "$RET_MENU"
   [ "$rc" -ne 0 ] && return 1
 
+  parted_label="$(get_parted_label_name "$pttype")" || fatal "Parted için partition table tipi dönüştürülemedi."
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[DRY-RUN] printf 'label: %s\n' '$pttype' | sfdisk '$disk'"
+    echo "[DRY-RUN] parted -s -f '$disk' mklabel '$parted_label'"
   else
-    run_sfdisk_input "label: $pttype" "$disk" || fatal "Partition table oluşturulamadı."
+    run_parted_disk_command "$disk" mklabel "$parted_label" || fatal "Partition table oluşturulamadı."
     run_cmd partx -u "$disk" || true
   fi
 
@@ -2814,72 +3517,92 @@ get_partition_type_code() {
   return 0
 }
 
-create_partition_at_disk_end() {
+create_partition_in_free_space() {
   local disk="$1"
   local size_bytes="$2"
   local usage="$3"
 
-  local pttype type_code disk_free_bytes old_last new_last part_spec
+  local pttype disk_free_bytes before_parts new_part geometry
+  local start_sector end_sector final_bytes chosen_range_bytes new_partnum part_name
 
   pttype="$(get_pttype "$disk")"
   [ -n "$pttype" ] || fatal "Partition table tipi bulunamadı."
 
-  get_partition_type_code "$pttype" "$usage" || fatal "Partition type code belirlenemedi."
-  type_code="$REPLY_VALUE"
-
-  get_disk_tail_free_bytes "$disk" || fatal "Disk boş alanı hesaplanamadı."
+  get_disk_largest_free_bytes "$disk" || fatal "Disk boş alanı hesaplanamadı."
   disk_free_bytes="$REPLY_VALUE"
 
   if [ "$disk_free_bytes" -le 0 ]; then
-    fatal "Diskin sonunda kullanılabilir boş alan yok."
+    fatal "Diskte partitionlanabilir boş alan yok."
   fi
 
   if [ "$size_bytes" -gt "$disk_free_bytes" ]; then
     size_bytes="$disk_free_bytes"
   fi
 
-  old_last="$(get_last_partition_path_on_disk "$disk" || true)"
-  part_spec="$(build_sfdisk_partition_spec "$disk" "$size_bytes" "$type_code")" || fatal "Yeni partition spec oluşturulamadı."
+  before_parts="$(get_partition_paths_on_disk "$disk" || true)"
+  calculate_partition_create_geometry "$disk" "$size_bytes" || fatal "Yeni partition geometrisi oluşturulamadı."
+  geometry="$REPLY_VALUE"
+  IFS=: read -r start_sector end_sector final_bytes chosen_range_bytes <<EOF
+$geometry
+EOF
 
   info "Yeni partition oluşturuluyor..."
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[DRY-RUN] printf '%s\\n' '$part_spec' | sfdisk --append '$disk'"
-    new_last="$(predict_next_partition_path "$disk" "$old_last")" || fatal "Dry-run için yeni partition yolu tahmin edilemedi."
+    if [ "$pttype" = "gpt" ]; then
+      part_name="data"
+      [ "$usage" = "lvm" ] && part_name="lvm"
+      echo "[DRY-RUN] parted -s -f '$disk' unit s mkpart '$part_name' ext4 '${start_sector}s' '${end_sector}s'"
+    else
+      echo "[DRY-RUN] parted -s -f '$disk' unit s mkpart primary ext4 '${start_sector}s' '${end_sector}s'"
+    fi
+    new_part="$(predict_next_partition_path "$disk")" || fatal "Dry-run için yeni partition yolu tahmin edilemedi."
   else
-    run_sfdisk_input "$part_spec" --append "$disk" || fatal "Yeni partition oluşturulamadı."
-    new_last="$(get_last_partition_path_on_disk "$disk" || true)"
-    [ -n "$new_last" ] || fatal "Yeni partition yolu tespit edilemedi."
+    if [ "$pttype" = "gpt" ]; then
+      part_name="data"
+      [ "$usage" = "lvm" ] && part_name="lvm"
+      run_parted_disk_command "$disk" unit s mkpart "$part_name" ext4 "${start_sector}s" "${end_sector}s" || fatal "Yeni partition oluşturulamadı."
+    else
+      run_parted_disk_command "$disk" unit s mkpart primary ext4 "${start_sector}s" "${end_sector}s" || fatal "Yeni partition oluşturulamadı."
+    fi
   fi
 
   run_cmd partx -u "$disk" || warn "Kernel yeni partition bilgisini hemen okuyamadı. Reboot gerekebilir."
 
-  if [ -n "$old_last" ] && [ "$old_last" = "$new_last" ] && [ "$DRY_RUN" -ne 1 ]; then
-    fatal "Yeni partition tespit edilemedi. Son partition değişmemiş görünüyor."
+  if [ "$DRY_RUN" -ne 1 ]; then
+    new_part="$(find_new_partition_path_on_disk "$disk" "$before_parts" || true)"
+    [ -n "$new_part" ] || fatal "Yeni partition yolu tespit edilemedi."
+    new_partnum="$(get_partnum "$new_part" || true)"
+    if [ "$usage" = "lvm" ] && [ -n "$new_partnum" ]; then
+      case "$pttype" in
+        gpt)
+          run_parted_disk_command "$disk" type "$new_partnum" E6D6D379-F507-44C2-A23C-238F2A3DF928 || warn "Yeni partition için GPT LVM tipi atanamadı."
+          ;;
+        dos|msdos)
+          run_parted_disk_command "$disk" set "$new_partnum" lvm on || warn "Yeni partition için LVM flag atanamadı."
+          ;;
+      esac
+    fi
   fi
 
-  REPLY_VALUE="$new_last"
+  REPLY_VALUE="$new_part"
   return 0
 }
 
 ###############################################################################
-# Shared: grow last partition to exact target bytes
+# Shared: grow partition to exact target bytes within contiguous free space
 ###############################################################################
 
 grow_partition_to_target_bytes() {
   local part="$1"
   local target_bytes="$2"
 
-  local disk partnum sfdisk_line start_sector current_sectors sector_size disk_bytes
-  local total_sectors part_end_sector free_after_sectors max_sectors max_bytes
-  local final_bytes final_sectors part_spec new_spec
+  local disk partnum sfdisk_line start_sector current_sectors sector_size part_limit_sector
+  local part_end_sector free_after_sectors max_sectors max_bytes
+  local final_bytes final_sectors final_end_sector
 
   disk="$(get_parent_disk "$part")" || fatal "Parent disk bulunamadı."
   partnum="$(get_partnum "$part")"
   [ -n "$partnum" ] || fatal "Partition numarası bulunamadı."
-
-  if ! is_last_partition_on_disk "$disk" "$part"; then
-    fatal "Seçilen partition diskin son partition'ı değil. Güvenli büyütme için yalnızca son partition desteklenir."
-  fi
 
   sfdisk_line="$(get_sfdisk_line "$disk" "$part")"
   [ -n "$sfdisk_line" ] || fatal "Partition bilgisi sfdisk ile okunamadı."
@@ -2887,14 +3610,14 @@ grow_partition_to_target_bytes() {
   start_sector="$(get_start_sector_from_line "$sfdisk_line")"
   current_sectors="$(get_size_sector_from_line "$sfdisk_line")"
   sector_size="$(blockdev --getss "$disk")"
-  disk_bytes="$(blockdev --getsize64 "$disk")"
+  get_partition_growth_limit_sector "$disk" "$part" || fatal "Partition için büyüme sınırı belirlenemedi."
+  part_limit_sector="$REPLY_VALUE"
 
   [ -n "$start_sector" ] || fatal "Partition başlangıç sektörü okunamadı."
   [ -n "$current_sectors" ] || fatal "Partition sektör boyutu okunamadı."
 
-  total_sectors=$((disk_bytes / sector_size))
   part_end_sector=$((start_sector + current_sectors))
-  free_after_sectors=$((total_sectors - part_end_sector))
+  free_after_sectors=$((part_limit_sector - part_end_sector))
   [ "$free_after_sectors" -lt 0 ] && free_after_sectors=0
 
   max_sectors=$((current_sectors + free_after_sectors))
@@ -2914,14 +3637,13 @@ grow_partition_to_target_bytes() {
     return 0
   fi
 
-  part_spec="$(echo "$sfdisk_line" | cut -d: -f2-)"
-  new_spec="$(echo "$part_spec" | sed -E "s/(size=)[[:space:]]*[0-9]+/\1 ${final_sectors}/")"
+  final_end_sector=$((start_sector + final_sectors - 1))
 
   info "Partition tablosu güncelleniyor..."
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[DRY-RUN] printf '%s\n' \"$new_spec\" | sfdisk --no-reread --force -N \"$partnum\" \"$disk\""
+    echo "[DRY-RUN] parted -s -f '$disk' unit s resizepart '$partnum' '${final_end_sector}s'"
   else
-    run_sfdisk_input "$new_spec" --no-reread --force -N "$partnum" "$disk" || fatal "Partition tablosu güncellenemedi."
+    run_parted_disk_command "$disk" unit s resizepart "$partnum" "${final_end_sector}s" || fatal "Partition tablosu güncellenemedi."
   fi
 
   info "Kernel'e yeni partition bilgisi okutuluyor..."
@@ -2937,9 +3659,9 @@ validate_partition_growth_plan() {
   local fstype="$3"
   local mnt="$4"
 
-  local disk partnum sfdisk_line start_sector current_sectors sector_size disk_bytes
-  local total_sectors part_end_sector free_after_sectors max_sectors max_bytes
-  local final_bytes final_sectors part_spec new_spec
+  local disk partnum sfdisk_line start_sector current_sectors sector_size part_limit_sector
+  local part_end_sector free_after_sectors max_sectors max_bytes
+  local final_bytes final_sectors final_end_sector
 
   validation_plan_reset
 
@@ -2947,12 +3669,11 @@ validate_partition_growth_plan() {
   partnum="$(get_partnum "$part")"
   [ -n "$partnum" ] || return 1
 
-  if ! is_last_partition_on_disk "$disk" "$part"; then
-    validation_plan_add fail "target partition is not the last partition on disk"
-    warn "Dry-run doğrulaması başarısız: hedef partition diskin son partition'ı değil."
-    return 1
+  if is_last_partition_on_disk "$disk" "$part"; then
+    validation_plan_add ok "target partition is the last partition on disk"
+  else
+    validation_plan_add ok "target partition is not last; growth will use only contiguous free space after it"
   fi
-  validation_plan_add ok "target partition is the last partition on disk"
 
   sfdisk_line="$(get_sfdisk_line "$disk" "$part")"
   [ -n "$sfdisk_line" ] || return 1
@@ -2960,14 +3681,14 @@ validate_partition_growth_plan() {
   start_sector="$(get_start_sector_from_line "$sfdisk_line")"
   current_sectors="$(get_size_sector_from_line "$sfdisk_line")"
   sector_size="$(blockdev --getss "$disk")"
-  disk_bytes="$(blockdev --getsize64 "$disk")"
+  get_partition_growth_limit_sector "$disk" "$part" || return 1
+  part_limit_sector="$REPLY_VALUE"
 
   [ -n "$start_sector" ] || return 1
   [ -n "$current_sectors" ] || return 1
 
-  total_sectors=$((disk_bytes / sector_size))
   part_end_sector=$((start_sector + current_sectors))
-  free_after_sectors=$((total_sectors - part_end_sector))
+  free_after_sectors=$((part_limit_sector - part_end_sector))
   [ "$free_after_sectors" -lt 0 ] && free_after_sectors=0
 
   max_sectors=$((current_sectors + free_after_sectors))
@@ -2983,19 +3704,18 @@ validate_partition_growth_plan() {
 
   if [ "$final_sectors" -le "$current_sectors" ]; then
     validation_plan_add fail "no additional sectors available for safe growth"
-    warn "Dry-run doğrulaması: partition için büyütülebilir ek alan görünmüyor."
+    warn "Dry-run doğrulaması: partition arkasında büyütülebilir bitişik ek alan görünmüyor."
     return 1
   fi
 
-  part_spec="$(echo "$sfdisk_line" | cut -d: -f2-)"
-  new_spec="$(echo "$part_spec" | sed -E "s/(size=)[[:space:]]*[0-9]+/\1 ${final_sectors}/")"
-
-  printf '%s\n' "$new_spec" | sfdisk --no-act --no-reread --force -N "$partnum" "$disk" >/dev/null 2>&1 || {
-    validation_plan_add fail "sfdisk no-act growth validation rejected"
-    warn "Dry-run doğrulaması başarısız: sfdisk hedef büyütmeyi kabul etmedi."
+  verify_parted_disk_query "$disk" || {
+    validation_plan_add fail "parted disk query failed"
+    warn "Dry-run doğrulaması başarısız: parted disk sorgusu başarısız oldu."
     return 1
   }
-  validation_plan_add ok "sfdisk no-act growth validation passed"
+  validation_plan_add ok "parted disk query passed"
+  final_end_sector=$((start_sector + final_sectors - 1))
+  validation_plan_add ok "parted resize geometry prepared: end=${final_end_sector}s"
 
   verify_command_step partx -u "$disk" || {
     validation_plan_add fail "kernel reread pre-check failed"
@@ -3250,7 +3970,7 @@ create_new_partition_flow() {
   local vg_name lv_name lv_path
 
   title "Yeni partition oluşturma"
-  echo "Açıklama: Seçilen diskin sonundaki boş alanı kullanarak yeni partition oluşturur."
+  echo "Açıklama: Seçilen diskteki uygun boş alanı kullanarak yeni partition oluşturur."
   echo "Bu işlemde kullanıcıdan yapı tipi, filesystem tipi ve mountpoint seçimi alınır."
   echo "İşlem sonunda yeni yapı otomatik mount edilir ve /etc/fstab içine eklenir."
   echo
@@ -3272,16 +3992,16 @@ create_new_partition_flow() {
   [ "$rc" -ne 0 ] && return 1
   pttype="$REPLY_VALUE"
 
-  get_disk_tail_free_bytes "$disk" || fatal "Disk boş alanı hesaplanamadı."
+  get_disk_largest_free_bytes "$disk" || fatal "Disk boş alanı hesaplanamadı."
   disk_free_bytes="$REPLY_VALUE"
 
   echo "${C_CYAN}Seçilen disk${C_RESET}        : $disk"
   echo "${C_CYAN}Partition table${C_RESET}    : $pttype"
-  echo "${C_CYAN}Sondaki boş alan${C_RESET}    : $(bytes_to_human "$disk_free_bytes")"
+  echo "${C_CYAN}En büyük partition boşluğu${C_RESET}: $(bytes_to_human "$disk_free_bytes")"
   echo
 
   if [ "$disk_free_bytes" -le 0 ]; then
-    fatal "Diskin sonunda kullanılabilir boş alan yok."
+    fatal "Diskte partitionlanabilir boş alan yok."
   fi
 
   if [ -n "$CLI_STRUCTURE" ]; then
@@ -3387,7 +4107,7 @@ create_new_partition_flow() {
   [ "$rc" -eq "$RET_MENU" ] && return 0
   [ "$rc" -ne 0 ] && return 1
 
-  create_partition_at_disk_end "$disk" "$final_bytes" "$structure"
+  create_partition_in_free_space "$disk" "$final_bytes" "$structure"
   new_part="$REPLY_VALUE"
 
   if [ "$structure" = "normal" ]; then
@@ -3480,7 +4200,7 @@ grow_last_partition_exact() {
   local target_gb target_bytes final_bytes final_gb validated_bytes rc
 
   title "Bağımsız partition büyütme"
-  echo "Açıklama: Yalnızca diskin son partition'ını hedef boyuta kadar büyütür, ardından filesystem'i genişletir."
+  echo "Açıklama: Partition'ı hedef boyuta kadar, arkasındaki bitişik boş alan izin verdiği ölçüde büyütür; ardından filesystem'i genişletir."
   echo
 
   if [ -n "$CLI_TARGET" ]; then
@@ -3589,13 +4309,16 @@ grow_lvm_lv_full_chain() {
   local need_extra_bytes
   local pv pv_type pv_size_bytes pv_free_bytes
   local part_current_bytes pv_max_partition_bytes pv_possible_additional_bytes
-  local desired_partition_bytes actual_partition_bytes
+  local desired_partition_bytes actual_partition_bytes disk_allocatable_free_bytes
+  local new_pv_partition_bytes new_pv predicted_new_pv new_pv_disk
+  local other_disk_candidates first_other_disk other_disk_count=0
+  local other_disk size model free_bytes
   local post_pvresize_vg_free_bytes achievable_lv_max_bytes
   local lv_target_for_extend_string
-  local validated_target_bytes validated_partition_bytes rc
+  local validated_target_bytes validated_partition_bytes rc growth_blocker_reason
 
   title "LVM tam zincir büyütme"
-  echo "Açıklama: Gerekirse alttaki PV partition'ını büyütür, ardından pvresize, lvextend ve filesystem grow yapar."
+  echo "Açıklama: Gerekirse seçilen PV partition'ını arkasındaki bitişik boş alana doğru büyütür; bu mümkün değilse uygun boş alanı olan bir diskte yeni PV oluşturup VG'ye ekler."
   echo
 
   if [ -n "$CLI_TARGET" ]; then
@@ -3727,32 +4450,30 @@ grow_lvm_lv_full_chain() {
   [ -n "$pv_size_bytes" ] || fatal "PV boyutu okunamadı."
   [ -n "$part_current_bytes" ] || fatal "PV partition boyutu okunamadı."
 
-  local disk partnum sfdisk_line start_sector current_sectors sector_size disk_bytes
-  local total_sectors part_end_sector free_after_sectors max_sectors
+  local disk partnum sfdisk_line start_sector current_sectors sector_size part_limit_sector
+  local part_end_sector free_after_sectors max_sectors
 
   disk="$(get_parent_disk "$pv")" || fatal "PV için parent disk bulunamadı."
   partnum="$(get_partnum "$pv")"
   [ -n "$partnum" ] || fatal "PV partition numarası bulunamadı."
-
-  if ! is_last_partition_on_disk "$disk" "$pv"; then
-    fatal "Seçilen PV partition diskin son partition'ı değil. Güvenli otomatik zincir büyütme için yalnızca son partition desteklenir."
-  fi
 
   sfdisk_line="$(get_sfdisk_line "$disk" "$pv")"
   [ -n "$sfdisk_line" ] || fatal "PV partition bilgisi sfdisk ile okunamadı."
   start_sector="$(get_start_sector_from_line "$sfdisk_line")"
   current_sectors="$(get_size_sector_from_line "$sfdisk_line")"
   sector_size="$(blockdev --getss "$disk")"
-  disk_bytes="$(blockdev --getsize64 "$disk")"
+  get_partition_growth_limit_sector "$disk" "$pv" || fatal "PV partition için büyüme sınırı belirlenemedi."
+  part_limit_sector="$REPLY_VALUE"
 
-  total_sectors=$((disk_bytes / sector_size))
   part_end_sector=$((start_sector + current_sectors))
-  free_after_sectors=$((total_sectors - part_end_sector))
+  free_after_sectors=$((part_limit_sector - part_end_sector))
   [ "$free_after_sectors" -lt 0 ] && free_after_sectors=0
   max_sectors=$((current_sectors + free_after_sectors))
   pv_max_partition_bytes=$((max_sectors * sector_size))
   pv_possible_additional_bytes=$((pv_max_partition_bytes - part_current_bytes))
   [ "$pv_possible_additional_bytes" -lt 0 ] && pv_possible_additional_bytes=0
+  get_disk_largest_free_bytes "$disk" || disk_allocatable_free_bytes=0
+  [ -n "${disk_allocatable_free_bytes:-}" ] || disk_allocatable_free_bytes=0
 
   echo "Seçilen PV detayları:"
   echo "  PV                  : $pv"
@@ -3760,11 +4481,124 @@ grow_lvm_lv_full_chain() {
   echo "  PV mevcut boyut     : $(bytes_to_human "$pv_size_bytes")"
   echo "  Partition boyutu    : $(bytes_to_human "$part_current_bytes")"
   echo "  Partition ek büyüme : $(bytes_to_human "$pv_possible_additional_bytes")"
+  echo "  En büyük partition boşluğu : $(bytes_to_human "$disk_allocatable_free_bytes")"
+  show_disk_free_ranges "$disk"
   echo
 
   if [ "$pv_possible_additional_bytes" -le 0 ]; then
-    warn "Seçilen PV partition için ek büyüme alanı yok."
-    achievable_lv_max_bytes="$max_direct_bytes"
+    warn "Seçilen PV partition için bitişik ek büyüme alanı yok."
+    echo "Not: $pv bir LVM PV olsa da, pvresize yalnızca kernelin gördüğü partition boyutunu kullanır."
+    echo "Bu yüzden mevcut PV'yi büyütmek için parted tarafında partition geometrisinin de büyüyebilmesi gerekir."
+    echo
+
+    new_pv_disk="$disk"
+    if [ "$disk_allocatable_free_bytes" -le 0 ]; then
+      other_disk_candidates="$(get_disks_with_allocatable_free_space "$disk" || true)"
+      if [ -z "$other_disk_candidates" ]; then
+        achievable_lv_max_bytes="$max_direct_bytes"
+        growth_blocker_reason="Seçilen PV arkasında bitişik boş alan yok; parted sorgusuna göre ne $disk üzerinde ne de başka bir diskte yeni bir PV oluşturacak partitionlanabilir boş alan bulunamadı. Bu, filesystem/VG içi boşluk değil, partition table seviyesinde ayrılmamış alan gerektiği anlamına gelir."
+      else
+        echo "Seçilen diskte yeni PV oluşturacak partitionlanabilir boş alan görünmüyor."
+        echo "Ancak başka disklerde uygun boş alan bulundu:"
+        echo
+        while IFS='|' read -r other_disk size model free_bytes; do
+          [ -n "$other_disk" ] || continue
+          printf '  - %s %s free=%s %s\n' "$other_disk" "$size" "$(bytes_to_human "$free_bytes")" "${model:--}"
+          if [ -z "$first_other_disk" ]; then
+            first_other_disk="$other_disk"
+          fi
+          other_disk_count=$((other_disk_count + 1))
+        done <<EOF
+$other_disk_candidates
+EOF
+        echo
+
+        if [ "$other_disk_count" -eq 1 ] && [ -n "$first_other_disk" ]; then
+          new_pv_disk="$first_other_disk"
+          info "Yeni PV için otomatik seçilen disk: $new_pv_disk"
+        else
+          select_disk_with_allocatable_free_space "$disk"
+          rc=$?
+          [ "$rc" -eq "$RET_MENU" ] && return 0
+          [ "$rc" -ne 0 ] && return 1
+          new_pv_disk="$REPLY_VALUE"
+        fi
+
+        get_disk_largest_free_bytes "$new_pv_disk" || fatal "Yeni PV için seçilen diskin boş alanı okunamadı."
+        disk_allocatable_free_bytes="$REPLY_VALUE"
+      fi
+    fi
+
+    if [ -z "${growth_blocker_reason:-}" ]; then
+      new_pv_partition_bytes="$disk_allocatable_free_bytes"
+      if [ "$new_pv_partition_bytes" -gt "$need_extra_bytes" ]; then
+        new_pv_partition_bytes="$need_extra_bytes"
+      fi
+
+      echo "Alternatif zincir büyütme özeti:"
+      echo "  1) Uygun boş alanda yeni LVM partition oluşturulacak"
+      echo "  2) pvcreate"
+      echo "  3) vgextend"
+      echo "  4) lvextend"
+      echo "  5) filesystem büyütülecek"
+      echo
+
+      validate_partition_create_plan "$new_pv_disk" "$new_pv_partition_bytes" "lvm" || return 1
+      predicted_new_pv="$REPLY_VALUE"
+      show_action_validation_result "Yeni PV partition oluşturma" "$new_pv_disk" "yeni PV=$predicted_new_pv boyut=$(bytes_to_human "$new_pv_partition_bytes")" || return 1
+
+      confirm "$new_pv_disk için önce partition table yedeği alınsın mı?"
+      rc=$?
+      [ "$rc" -eq "$RET_MENU" ] && return 0
+      [ "$rc" -ne 0 ] && fatal "Yedek alınmadan devam edilmedi."
+
+      backup_partition_table "$new_pv_disk" 1 || fatal "Partition table yedeği alınamadı."
+      backup_lvm_metadata "$vg_name" >/dev/null 2>&1 || true
+
+      confirm "Dry-run başarılı. Önce $new_pv_disk üzerinde yeni bir LVM partition oluşturulsun mu?"
+      rc=$?
+      [ "$rc" -eq "$RET_MENU" ] && return 0
+      [ "$rc" -ne 0 ] && return 1
+
+      create_partition_in_free_space "$new_pv_disk" "$new_pv_partition_bytes" "lvm"
+      new_pv="$REPLY_VALUE"
+
+      validate_lvm_pvcreate_plan "$new_pv" || return 1
+      show_action_validation_result "Yeni PV hazırlama" "$new_pv" "pvcreate" || return 1
+
+      confirm "Dry-run başarılı. $new_pv üzerinde pvcreate uygulansın mı?"
+      rc=$?
+      [ "$rc" -eq "$RET_MENU" ] && return 0
+      [ "$rc" -ne 0 ] && return 1
+
+      run_cmd pvcreate "$new_pv" || fatal "pvcreate başarısız oldu."
+
+      validate_lvm_vgextend_plan "$vg_name" "$new_pv" || return 1
+      show_action_validation_result "VG genişletme" "$vg_name" "vgextend $new_pv" || return 1
+
+      confirm "Dry-run başarılı. $new_pv mevcut VG içine eklensin mi?"
+      rc=$?
+      [ "$rc" -eq "$RET_MENU" ] && return 0
+      [ "$rc" -ne 0 ] && return 1
+
+      backup_lvm_metadata "$vg_name" >/dev/null 2>&1 || true
+      run_cmd vgextend "$vg_name" "$new_pv" || fatal "vgextend başarısız oldu."
+
+      post_pvresize_vg_free_bytes="$(get_vg_free_bytes "$vg_name")"
+      [ -n "$post_pvresize_vg_free_bytes" ] || fatal "vgextend sonrası VG boş alanı okunamadı."
+      achievable_lv_max_bytes=$((current_lv_bytes + post_pvresize_vg_free_bytes))
+
+      validate_lvm_post_pv_growth_plan "$lv" "$target_bytes" "$current_lv_bytes" "$fstype" "$mnt" "$vg_name" || return 1
+      validated_target_bytes="$REPLY_VALUE"
+      show_dry_run_validation_result "Yeni PV sonrası LVM büyütme" "$lv" "$current_lv_bytes" "$target_bytes" "$validated_target_bytes" || return 1
+
+      confirm "Dry-run başarılı. Şimdi lvextend + filesystem grow adımları uygulansın mı?"
+      rc=$?
+      [ "$rc" -eq "$RET_MENU" ] && return 0
+      [ "$rc" -ne 0 ] && return 1
+    else
+      achievable_lv_max_bytes="$max_direct_bytes"
+    fi
   else
     desired_partition_bytes=$((part_current_bytes + need_extra_bytes))
     if [ "$desired_partition_bytes" -gt "$pv_max_partition_bytes" ]; then
@@ -3820,15 +4654,18 @@ grow_lvm_lv_full_chain() {
     [ "$rc" -ne 0 ] && return 1
   fi
 
+  if [ "$achievable_lv_max_bytes" -le "$current_lv_bytes" ]; then
+    if [ -n "${growth_blocker_reason:-}" ]; then
+      fatal "$growth_blocker_reason"
+    fi
+    fatal "LVM zincir büyütme sonrası LV için büyütülebilir alan kalmadı."
+  fi
+
   if [ "$target_bytes" -gt "$achievable_lv_max_bytes" ]; then
     warn "Hedefe tam ulaşılamadı. LV mümkün olan en yüksek değere çıkarılacak."
     final_target_bytes="$achievable_lv_max_bytes"
   else
     final_target_bytes="$target_bytes"
-  fi
-
-  if [ "$final_target_bytes" -le "$current_lv_bytes" ]; then
-    fatal "LVM zincir büyütme sonrası LV için büyütülebilir alan kalmadı."
   fi
 
   final_target_gb="$(bytes_to_gb "$final_target_bytes")"
@@ -3858,6 +4695,12 @@ run_cli_action() {
       ;;
     create)
       create_new_partition_flow
+      ;;
+    delete-part)
+      [ -n "$CLI_TARGET" ] || fatal "--target gerekli"
+      resolve_partition_selection "$CLI_TARGET" || fatal "Geçersiz partition: $CLI_TARGET"
+      CLI_TARGET="$REPLY_VALUE"
+      delete_partition_flow
       ;;
     grow-part)
       grow_last_partition_exact
@@ -3936,12 +4779,13 @@ print_menu() {
   echo "  ${C_CYAN}11)${C_RESET} Partition table geri yükle        - Daha önce alınan sfdisk yedeğini diske geri yükler."
   echo "  ${C_CYAN}12)${C_RESET} Partition table yeniden okut      - Kernel'e partition tablosunu yeniden okutmayı dener."
   echo "  ${C_CYAN}13)${C_RESET} Yeni partition oluştur            - Bağımsız partition veya LVM yapıda yeni partition oluşturur, mount eder, fstab'a ekler."
-  echo "  ${C_CYAN}14)${C_RESET} Bağımsız partition büyüt         - Son partition'ı büyütür ve filesystem'i genişletir."
-  echo "  ${C_CYAN}15)${C_RESET} LVM tam zincir büyüt              - PV grow + pvresize + lvextend + filesystem grow."
-  echo "  ${C_CYAN}16)${C_RESET} Mount kaldır                       - Seçilen mountpoint'i unmount eder."
-  echo "  ${C_CYAN}17)${C_RESET} fstab kaydı sil                    - Seçilen fstab kaydını siler."
-  echo "  ${C_CYAN}18)${C_RESET} Mount kaldır + fstab temizle       - Unmount eder ve fstab kaydını siler."
-  echo "  ${C_CYAN}19)${C_RESET} Çıkış                             - Script'ten çıkar."
+  echo "  ${C_CYAN}14)${C_RESET} Partition sil                      - Güvenlik kontrolleriyle seçilen partition'ı siler."
+  echo "  ${C_CYAN}15)${C_RESET} Bağımsız partition büyüt         - Partition'ı bitişik boş alan kadar büyütür ve filesystem'i genişletir."
+  echo "  ${C_CYAN}16)${C_RESET} LVM tam zincir büyüt              - PV grow + pvresize + lvextend + filesystem grow."
+  echo "  ${C_CYAN}17)${C_RESET} Mount kaldır                       - Seçilen mountpoint'i unmount eder."
+  echo "  ${C_CYAN}18)${C_RESET} fstab kaydı sil                    - Seçilen fstab kaydını siler."
+  echo "  ${C_CYAN}19)${C_RESET} Mount kaldır + fstab temizle       - Unmount eder ve fstab kaydını siler."
+  echo "  ${C_CYAN}20)${C_RESET} Çıkış                             - Script'ten çıkar."
   echo
 }
 
@@ -3950,7 +4794,7 @@ main_loop() {
 
   while true; do
     print_menu
-    ask_menu_choice "Yapmak istediğiniz işlemi seçin [1-19]" 1 19
+    ask_menu_choice "Yapmak istediğiniz işlemi seçin [1-20]" 1 20
     choice="$REPLY_VALUE"
     echo
 
@@ -4018,26 +4862,30 @@ main_loop() {
         pause_enter
         ;;
       14)
-        grow_last_partition_exact
+        delete_partition_flow
         pause_enter
         ;;
       15)
-        grow_lvm_lv_full_chain
+        grow_last_partition_exact
         pause_enter
         ;;
       16)
-        unmount_target_flow
+        grow_lvm_lv_full_chain
         pause_enter
         ;;
       17)
-        remove_fstab_entry_flow
+        unmount_target_flow
         pause_enter
         ;;
       18)
-        unmount_and_remove_fstab_flow
+        remove_fstab_entry_flow
         pause_enter
         ;;
       19)
+        unmount_and_remove_fstab_flow
+        pause_enter
+        ;;
+      20)
         quit_now
         ;;
     esac
