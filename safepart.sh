@@ -4,7 +4,7 @@ set -o pipefail
 
 ###############################################################################
 # safepart
-# v8.1.0
+# v8.2.0
 #
 # Desteklenen işlemler:
 # - Araç kontrolü
@@ -18,6 +18,7 @@ set -o pipefail
 # - Bağımsız partition büyütme + filesystem grow
 # - LVM tam zincir büyütme
 #   * PV partition grow -> pvresize -> lvextend -> filesystem grow
+#   * Whole-disk PV -> pvresize -> lvextend -> filesystem grow
 # - Mount kaldırma
 # - fstab kaydı silme
 # - Mount kaldır + fstab temizleme
@@ -28,12 +29,11 @@ set -o pipefail
 #
 # Bilinçli sınırlar:
 # - Otomatik partition create, diskteki uygun boş aralıklarla çalışır; mevcut partition grow ise yalnızca arkasındaki bitişik boş alanı kullanır
-# - LVM zincir büyütmede PV bir partition olmalıdır
 # - RAID / mdadm / multipath / btrfs / zfs / karmaşık crypt topolojileri desteklenmez
 ###############################################################################
 
 SCRIPT_NAME="$(basename "$0")"
-VERSION="8.1.0"
+VERSION="8.2.0"
 
 DRY_RUN=0
 ASSUME_YES=0
@@ -57,6 +57,7 @@ CLI_MOUNTPOINT=""
 CLI_STRUCTURE=""
 CLI_VG_NAME=""
 CLI_LV_NAME=""
+CLI_PV=""
 CLI_BACKUP_FILE=""
 
 VALIDATION_PLAN=()
@@ -86,6 +87,7 @@ Non-interactive action parametreleri:
   --structure normal|lvm
   --vg-name vg_data
   --lv-name lv_data
+  --pv /dev/sdXN | /dev/nvme0n1
   --backup-file /var/backups/safepart/sda_20260101_120000.sfdisk
 
 Örnek:
@@ -115,6 +117,7 @@ while [ $# -gt 0 ]; do
     --structure) CLI_STRUCTURE="${2:-}"; shift ;;
     --vg-name) CLI_VG_NAME="${2:-}"; shift ;;
     --lv-name) CLI_LV_NAME="${2:-}"; shift ;;
+    --pv) CLI_PV="${2:-}"; shift ;;
     --backup-file) CLI_BACKUP_FILE="${2:-}"; shift ;;
     *)
       echo "Bilinmeyen parametre: $1" >&2
@@ -309,7 +312,7 @@ verify_command_step() {
     partx)
       [ "${1:-}" = "-u" ] && [ -b "${2:-}" ]
       ;;
-    apt-get|dnf|yum|zypper)
+    apt-get|dnf|yum|zypper|apk)
       return 0
       ;;
     *)
@@ -973,6 +976,9 @@ detect_pkg_manager() {
   elif cmd_exists zypper; then
     REPLY_VALUE="zypper"
     return 0
+  elif cmd_exists apk; then
+    REPLY_VALUE="apk"
+    return 0
   fi
   return 1
 }
@@ -987,6 +993,9 @@ get_required_packages() {
       REPLY_VALUE="util-linux parted e2fsprogs xfsprogs lvm2 gawk grep sed coreutils procps-ng psmisc lsof smartmontools"
       ;;
     zypper)
+      REPLY_VALUE="util-linux parted e2fsprogs xfsprogs lvm2 gawk grep sed coreutils procps psmisc lsof smartmontools"
+      ;;
+    apk)
       REPLY_VALUE="util-linux parted e2fsprogs xfsprogs lvm2 gawk grep sed coreutils procps psmisc lsof smartmontools"
       ;;
     *)
@@ -1005,7 +1014,7 @@ install_required_tools() {
   echo
 
   detect_pkg_manager || {
-    warn "Desteklenen paket yöneticisi bulunamadı. apt/dnf/yum/zypper destekleniyor."
+    warn "Desteklenen paket yöneticisi bulunamadı. apt/dnf/yum/zypper/apk destekleniyor."
     return 1
   }
   mgr="$REPLY_VALUE"
@@ -1044,6 +1053,9 @@ install_required_tools() {
       ;;
     zypper)
       run_cmd zypper --non-interactive install $pkgs || fatal "Paket kurulumu başarısız oldu."
+      ;;
+    apk)
+      run_cmd apk add $pkgs || fatal "Paket kurulumu başarısız oldu."
       ;;
   esac
 
@@ -1664,6 +1676,25 @@ get_pv_free_bytes() {
   pvs --noheadings --units B --nosuffix -o pv_free "$1" 2>/dev/null | awk '{$1=$1; printf "%.0f", $1}'
 }
 
+get_pv_vg_name() {
+  pvs --noheadings -o vg_name "$1" 2>/dev/null | awk '{$1=$1; print; exit}'
+}
+
+get_pv_unclaimed_bytes() {
+  local pv="$1"
+  local pv_bytes device_bytes difference
+
+  pv_bytes="$(get_pv_size_bytes "$pv")" || return 1
+  device_bytes="$(blockdev --getsize64 "$pv" 2>/dev/null)" || return 1
+  [ -n "$pv_bytes" ] || return 1
+  [ -n "$device_bytes" ] || return 1
+
+  difference=$((device_bytes - pv_bytes))
+  [ "$difference" -lt 0 ] && difference=0
+  REPLY_VALUE="$difference"
+  return 0
+}
+
 list_only_partitions_with_sizes() {
   title "Seçilebilir partitionlar"
   echo "Açıklama: Bağımsız partition işlemleri için kullanılabilecek partitionları gösterir."
@@ -1875,27 +1906,54 @@ get_size_sector_from_line() {
 
 get_partitionable_end_sector_limit() {
   local disk="$1"
-  local dump pttype last_lba sector_size disk_bytes total_sectors
+  local dump pttype sector_size disk_bytes total_sectors
 
   dump="$(sfdisk -d "$disk" 2>/dev/null)" || return 1
   pttype="$(get_sfdisk_header_value "$dump" "label")"
-
-  if [ "$pttype" = "gpt" ]; then
-    last_lba="$(get_sfdisk_header_value "$dump" "last-lba")"
-    if [ -n "$last_lba" ]; then
-      REPLY_VALUE=$((last_lba + 1))
-      return 0
-    fi
-  fi
 
   sector_size="$(blockdev --getss "$disk" 2>/dev/null)" || return 1
   disk_bytes="$(blockdev --getsize64 "$disk" 2>/dev/null)" || return 1
   total_sectors=$((disk_bytes / sector_size))
 
+  # Disk büyütüldüğünde secondary GPT header ve sfdisk last-lba eski kapasiteyi
+  # göstermeye devam edebilir. Büyümede block device boyutu esas alınır; parted
+  # -f resizepart sırasında secondary GPT header'ı yeni sona taşır.
   if [ "$pttype" = "gpt" ] && [ "$total_sectors" -gt 33 ]; then
     REPLY_VALUE=$((total_sectors - 33))
+  elif [ "$pttype" = "dos" ] && [ "$total_sectors" -gt 4294967296 ]; then
+    # DOS/MBR uses 32-bit sector addresses. This cap also handles 4Kn disks
+    # correctly because the limit is expressed in logical sectors.
+    REPLY_VALUE=4294967296
   else
     REPLY_VALUE="$total_sectors"
+  fi
+  return 0
+}
+
+refresh_partition_size() {
+  local disk="$1"
+  local part="$2"
+  local expected_bytes="$3"
+  local observed_bytes
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[DRY-RUN] kernel partition görünümü yenilenecek: $part"
+    return 0
+  fi
+
+  partx -u "$disk" >/dev/null 2>&1 || true
+  if cmd_exists partprobe; then
+    partprobe "$disk" >/dev/null 2>&1 || true
+  fi
+  if cmd_exists udevadm; then
+    udevadm settle >/dev/null 2>&1 || true
+  fi
+
+  observed_bytes="$(blockdev --getsize64 "$part" 2>/dev/null || true)"
+  [ -n "$observed_bytes" ] || return 1
+  if [ "$observed_bytes" -lt "$expected_bytes" ]; then
+    warn "Kernel hâlâ eski partition boyutunu görüyor: beklenen=$(bytes_to_human "$expected_bytes"), görülen=$(bytes_to_human "$observed_bytes")."
+    return 1
   fi
   return 0
 }
@@ -2991,7 +3049,8 @@ resolve_vg_pv_selection() {
       [ -n "$pv" ] || continue
       if [ "$index" -eq "$input" ]; then
         dtype="$(lsblk -no TYPE "$pv" 2>/dev/null | head -n1 | awk '{$1=$1;print}')"
-        [ "$dtype" = "part" ] || return 1
+        case "$dtype" in part|disk) ;; *) return 1 ;; esac
+        [ "$(get_pv_vg_name "$pv")" = "$vg" ] || return 1
         REPLY_VALUE="$pv"
         return 0
       fi
@@ -3002,7 +3061,8 @@ resolve_vg_pv_selection() {
 
   [ -b "$input" ] || return 1
   dtype="$(lsblk -no TYPE "$input" 2>/dev/null | head -n1 | awk '{$1=$1;print}')"
-  [ "$dtype" = "part" ] || return 1
+  case "$dtype" in part|disk) ;; *) return 1 ;; esac
+  [ "$(get_pv_vg_name "$input")" = "$vg" ] || return 1
   REPLY_VALUE="$input"
   return 0
 }
@@ -3027,7 +3087,28 @@ select_lvm_for_ops() {
 
 select_vg_pv_for_ops() {
   local vg="$1"
-  local input
+  local input pv size free count=0 only_pv=""
+
+  if [ -n "$CLI_PV" ]; then
+    resolve_vg_pv_selection "$vg" "$CLI_PV" || fatal "Geçersiz veya $vg üyesi olmayan PV: $CLI_PV"
+    return 0
+  fi
+
+  if [ -n "$CLI_ACTION" ]; then
+    while IFS='|' read -r pv size free; do
+      [ -n "$pv" ] || continue
+      count=$((count + 1))
+      only_pv="$pv"
+    done < <(get_vg_pv_list "$vg")
+
+    if [ "$count" -eq 1 ]; then
+      REPLY_VALUE="$only_pv"
+      info "VG içindeki tek PV otomatik seçildi: $only_pv"
+      return 0
+    fi
+    fatal "VG içinde $count PV var. Non-interactive kullanımda büyütülecek PV'yi --pv ile belirtin."
+  fi
+
   while true; do
     list_vg_pvs "$vg"
     echo "Seçim yöntemi: listedeki numarayı veya doğrudan PV yolunu girin."
@@ -3647,7 +3728,8 @@ grow_partition_to_target_bytes() {
   fi
 
   info "Kernel'e yeni partition bilgisi okutuluyor..."
-  run_cmd partx -u "$disk" || warn "Kernel yeni partition bilgisini hemen okuyamadı. Reboot gerekebilir."
+  refresh_partition_size "$disk" "$part" "$final_bytes" || \
+    fatal "Kernel yeni partition boyutunu etkinleştiremedi. Filesystem/PV büyütülmedi; reboot sonrası işlemi yeniden çalıştırın."
 
   REPLY_VALUE="$final_bytes"
   return 0
@@ -3708,12 +3790,12 @@ validate_partition_growth_plan() {
     return 1
   fi
 
-  verify_parted_disk_query "$disk" || {
-    validation_plan_add fail "parted disk query failed"
-    warn "Dry-run doğrulaması başarısız: parted disk sorgusu başarısız oldu."
+  sfdisk -d "$disk" >/dev/null 2>&1 || {
+    validation_plan_add fail "partition table query failed"
+    warn "Dry-run doğrulaması başarısız: partition tablosu okunamadı."
     return 1
   }
-  validation_plan_add ok "parted disk query passed"
+  validation_plan_add ok "partition table query passed"
   final_end_sector=$((start_sector + final_sectors - 1))
   validation_plan_add ok "parted resize geometry prepared: end=${final_end_sector}s"
 
@@ -4308,6 +4390,7 @@ grow_lvm_lv_full_chain() {
   local final_target_bytes final_target_gb
   local need_extra_bytes
   local pv pv_type pv_size_bytes pv_free_bytes
+  local pv_device_bytes pv_unclaimed_bytes
   local part_current_bytes pv_max_partition_bytes pv_possible_additional_bytes
   local desired_partition_bytes actual_partition_bytes disk_allocatable_free_bytes
   local new_pv_partition_bytes new_pv predicted_new_pv new_pv_disk
@@ -4441,54 +4524,135 @@ grow_lvm_lv_full_chain() {
   pv="$REPLY_VALUE"
 
   pv_type="$(lsblk -no TYPE "$pv" 2>/dev/null | head -n1 | awk '{$1=$1;print}')"
-  [ "$pv_type" = "part" ] || fatal "Seçilen PV bir partition değil. Bu script yalnızca partition tabanlı PV topolojisini otomatik büyütür."
+  case "$pv_type" in
+    part|disk) ;;
+    *) fatal "Seçilen PV tipi desteklenmiyor: ${pv_type:--}. Yalnızca partition veya whole-disk PV güvenle büyütülebilir." ;;
+  esac
 
   pv_size_bytes="$(get_pv_size_bytes "$pv")"
   pv_free_bytes="$(get_pv_free_bytes "$pv")"
-  part_current_bytes="$(blockdev --getsize64 "$pv")"
+  pv_device_bytes="$(blockdev --getsize64 "$pv")"
+  part_current_bytes="$pv_device_bytes"
 
   [ -n "$pv_size_bytes" ] || fatal "PV boyutu okunamadı."
-  [ -n "$part_current_bytes" ] || fatal "PV partition boyutu okunamadı."
+  [ -n "$pv_device_bytes" ] || fatal "PV block device boyutu okunamadı."
+
+  # Hypervisor/SAN tarafında disk veya partition daha önce büyütülmüş olabilir.
+  # Böyle bir durumda partition tablosuna dokunmadan önce PV'nin henüz görmediği
+  # alanı pvresize ile VG'ye kazandırmak gerekir. Eski akış bu durumu atlayıp
+  # hatalı biçimde yeni bir PV oluşturmaya çalışıyordu.
+  get_pv_unclaimed_bytes "$pv" || fatal "PV ile block device arasındaki boyut farkı okunamadı."
+  pv_unclaimed_bytes="$REPLY_VALUE"
+  if [ "$pv_unclaimed_bytes" -gt 1048576 ]; then
+    echo "Seçilen PV'nin block device üzerinde henüz kullanmadığı alan bulundu:"
+    echo "  PV                  : $pv"
+    echo "  PV tipi             : $pv_type"
+    echo "  Block device boyutu : $(bytes_to_human "$pv_device_bytes")"
+    echo "  LVM PV boyutu       : $(bytes_to_human "$pv_size_bytes")"
+    echo "  Kazanılabilir alan  : $(bytes_to_human "$pv_unclaimed_bytes")"
+    echo
+
+    verify_command_step pvresize "$pv" || fatal "pvresize test modu başarısız oldu."
+    confirm "$pv için önce pvresize çalıştırılıp mevcut block device alanı VG'ye kazandırılsın mı?"
+    rc=$?
+    [ "$rc" -eq "$RET_MENU" ] && return 0
+    [ "$rc" -ne 0 ] && return 1
+
+    backup_lvm_metadata "$vg_name" >/dev/null 2>&1 || true
+    run_cmd pvresize "$pv" || fatal "pvresize başarısız oldu."
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+      achievable_lv_max_bytes=$((max_direct_bytes + pv_unclaimed_bytes))
+      if [ "$target_bytes" -gt "$achievable_lv_max_bytes" ]; then
+        warn "Dry-run: pvresize sonrasında da hedef için ek PV/partition alanı gerekecek."
+      else
+        ok "Dry-run: whole-disk/önceden büyütülmüş PV zinciri uygulanabilir görünüyor."
+      fi
+      echo "  Plan: pvresize $pv -> lvextend $lv -> filesystem grow"
+      return 0
+    fi
+
+    vg_free_bytes="$(get_vg_free_bytes "$vg_name")"
+    [ -n "$vg_free_bytes" ] || fatal "pvresize sonrası VG boş alanı okunamadı."
+    max_direct_bytes=$((current_lv_bytes + vg_free_bytes))
+
+    if [ "$target_bytes" -le "$max_direct_bytes" ]; then
+      validate_lvm_growth_plan "$lv" "$target_bytes" "$fstype" "$mnt" || return 1
+      validated_target_bytes="$REPLY_VALUE"
+      show_dry_run_validation_result "pvresize sonrası LVM büyütme" "$lv" "$current_lv_bytes" "$target_bytes" "$validated_target_bytes" || return 1
+
+      confirm "pvresize başarılı. Şimdi lvextend + filesystem grow uygulansın mı?"
+      rc=$?
+      [ "$rc" -eq "$RET_MENU" ] && return 0
+      [ "$rc" -ne 0 ] && return 1
+
+      final_target_bytes="$target_bytes"
+      final_target_gb="$(bytes_to_gb "$final_target_bytes")"
+      run_cmd lvextend -L "${final_target_bytes}B" "$lv" || fatal "lvextend başarısız oldu."
+      grow_filesystem "$lv" "$fstype" "$mnt"
+      ok "LVM büyütme işlemi tamamlandı."
+      audit "grow-lvm-pvresize lv=$lv vg=$vg_name pv=$pv old_gb=$current_lv_gb new_gb=$final_target_gb fs=$fstype mountpoint=${mnt:--}"
+      return 0
+    fi
+
+    need_extra_bytes=$((target_bytes - max_direct_bytes))
+    pv_size_bytes="$(get_pv_size_bytes "$pv")"
+  fi
 
   local disk partnum sfdisk_line start_sector current_sectors sector_size part_limit_sector
   local part_end_sector free_after_sectors max_sectors
 
-  disk="$(get_parent_disk "$pv")" || fatal "PV için parent disk bulunamadı."
-  partnum="$(get_partnum "$pv")"
-  [ -n "$partnum" ] || fatal "PV partition numarası bulunamadı."
+  if [ "$pv_type" = "part" ]; then
+    disk="$(get_parent_disk "$pv")" || fatal "PV için parent disk bulunamadı."
+    partnum="$(get_partnum "$pv")"
+    [ -n "$partnum" ] || fatal "PV partition numarası bulunamadı."
 
-  sfdisk_line="$(get_sfdisk_line "$disk" "$pv")"
-  [ -n "$sfdisk_line" ] || fatal "PV partition bilgisi sfdisk ile okunamadı."
-  start_sector="$(get_start_sector_from_line "$sfdisk_line")"
-  current_sectors="$(get_size_sector_from_line "$sfdisk_line")"
-  sector_size="$(blockdev --getss "$disk")"
-  get_partition_growth_limit_sector "$disk" "$pv" || fatal "PV partition için büyüme sınırı belirlenemedi."
-  part_limit_sector="$REPLY_VALUE"
+    sfdisk_line="$(get_sfdisk_line "$disk" "$pv")"
+    [ -n "$sfdisk_line" ] || fatal "PV partition bilgisi sfdisk ile okunamadı."
+    start_sector="$(get_start_sector_from_line "$sfdisk_line")"
+    current_sectors="$(get_size_sector_from_line "$sfdisk_line")"
+    sector_size="$(blockdev --getss "$disk")"
+    get_partition_growth_limit_sector "$disk" "$pv" || fatal "PV partition için büyüme sınırı belirlenemedi."
+    part_limit_sector="$REPLY_VALUE"
 
-  part_end_sector=$((start_sector + current_sectors))
-  free_after_sectors=$((part_limit_sector - part_end_sector))
-  [ "$free_after_sectors" -lt 0 ] && free_after_sectors=0
-  max_sectors=$((current_sectors + free_after_sectors))
-  pv_max_partition_bytes=$((max_sectors * sector_size))
-  pv_possible_additional_bytes=$((pv_max_partition_bytes - part_current_bytes))
-  [ "$pv_possible_additional_bytes" -lt 0 ] && pv_possible_additional_bytes=0
-  get_disk_largest_free_bytes "$disk" || disk_allocatable_free_bytes=0
-  [ -n "${disk_allocatable_free_bytes:-}" ] || disk_allocatable_free_bytes=0
+    part_end_sector=$((start_sector + current_sectors))
+    free_after_sectors=$((part_limit_sector - part_end_sector))
+    [ "$free_after_sectors" -lt 0 ] && free_after_sectors=0
+    max_sectors=$((current_sectors + free_after_sectors))
+    pv_max_partition_bytes=$((max_sectors * sector_size))
+    pv_possible_additional_bytes=$((pv_max_partition_bytes - part_current_bytes))
+    [ "$pv_possible_additional_bytes" -lt 0 ] && pv_possible_additional_bytes=0
+    if get_disk_largest_free_bytes "$disk"; then
+      disk_allocatable_free_bytes="$REPLY_VALUE"
+    else
+      disk_allocatable_free_bytes=0
+    fi
+  else
+    disk="$pv"
+    pv_max_partition_bytes="$part_current_bytes"
+    pv_possible_additional_bytes=0
+    disk_allocatable_free_bytes=0
+  fi
 
   echo "Seçilen PV detayları:"
   echo "  PV                  : $pv"
-  echo "  Parent disk         : $disk"
+  echo "  PV tipi             : $pv_type"
+  echo "  Parent/whole disk   : $disk"
   echo "  PV mevcut boyut     : $(bytes_to_human "$pv_size_bytes")"
-  echo "  Partition boyutu    : $(bytes_to_human "$part_current_bytes")"
+  echo "  Block device boyutu : $(bytes_to_human "$part_current_bytes")"
   echo "  Partition ek büyüme : $(bytes_to_human "$pv_possible_additional_bytes")"
   echo "  En büyük partition boşluğu : $(bytes_to_human "$disk_allocatable_free_bytes")"
   show_disk_free_ranges "$disk"
   echo
 
   if [ "$pv_possible_additional_bytes" -le 0 ]; then
-    warn "Seçilen PV partition için bitişik ek büyüme alanı yok."
-    echo "Not: $pv bir LVM PV olsa da, pvresize yalnızca kernelin gördüğü partition boyutunu kullanır."
-    echo "Bu yüzden mevcut PV'yi büyütmek için parted tarafında partition geometrisinin de büyüyebilmesi gerekir."
+    if [ "$pv_type" = "part" ]; then
+      warn "Seçilen PV partition için bitişik ek büyüme alanı yok."
+      echo "Not: pvresize yalnızca kernelin gördüğü partition boyutunu kullanır."
+      echo "Bu yüzden mevcut PV'yi büyütmek için partition geometrisinin de büyüyebilmesi gerekir."
+    else
+      warn "Whole-disk PV block device üzerinde pvresize ile kazanılabilecek ek alan yok."
+    fi
     echo
 
     new_pv_disk="$disk"
@@ -4496,7 +4660,11 @@ grow_lvm_lv_full_chain() {
       other_disk_candidates="$(get_disks_with_allocatable_free_space "$disk" || true)"
       if [ -z "$other_disk_candidates" ]; then
         achievable_lv_max_bytes="$max_direct_bytes"
-        growth_blocker_reason="Seçilen PV arkasında bitişik boş alan yok; parted sorgusuna göre ne $disk üzerinde ne de başka bir diskte yeni bir PV oluşturacak partitionlanabilir boş alan bulunamadı. Bu, filesystem/VG içi boşluk değil, partition table seviyesinde ayrılmamış alan gerektiği anlamına gelir."
+        if [ "$pv_type" = "part" ]; then
+          growth_blocker_reason="Seçilen PV arkasında bitişik boş alan yok; ne $disk üzerinde ne de başka bir diskte yeni PV oluşturacak partitionlanabilir boş alan bulundu."
+        else
+          growth_blocker_reason="Whole-disk PV $pv mevcut block device kapasitesinin tamamını kullanıyor ve yeni PV için uygun başka bir disk bulunamadı. Önce altyapıda diski büyütün veya VG'ye yeni bir disk ekleyin."
+        fi
       else
         echo "Seçilen diskte yeni PV oluşturacak partitionlanabilir boş alan görünmüyor."
         echo "Ancak başka disklerde uygun boş alan bulundu:"
@@ -4638,6 +4806,16 @@ EOF
     else
       info "pvresize çalıştırılıyor..."
       run_cmd pvresize "$pv" || fatal "pvresize başarısız oldu."
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+      achievable_lv_max_bytes=$((max_direct_bytes + actual_partition_bytes - part_current_bytes))
+      if [ "$target_bytes" -gt "$achievable_lv_max_bytes" ]; then
+        warn "Dry-run: hedefin tamamına ulaşılamaz; LV en fazla $(bytes_to_human "$achievable_lv_max_bytes") olabilir."
+      else
+        ok "Dry-run: partition -> pvresize -> lvextend -> filesystem zinciri uygulanabilir görünüyor."
+      fi
+      return 0
     fi
 
     post_pvresize_vg_free_bytes="$(get_vg_free_bytes "$vg_name")"
@@ -4914,4 +5092,6 @@ main() {
   main_loop
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

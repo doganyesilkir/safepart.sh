@@ -1,6 +1,6 @@
 # safepart
 
-`safepart`, Linux sistemlerde disk, partition, filesystem, LVM, mount ve `fstab` işlemlerini daha güvenli şekilde yönetmek için hazırlanmış etkileşimli bir Bash aracıdır.
+`safepart`, Linux sistemlerde disk, partition, filesystem, LVM, mount ve `fstab` işlemlerini daha güvenli şekilde yönetmek için hazırlanmış etkileşimli bir Bash aracıdır. Debian/Ubuntu, RHEL/Rocky/Alma/Fedora, SUSE/openSUSE ve Alpine ailelerindeki yaygın araç setlerini destekler.
 
 Script; özellikle aşağıdaki işlerde yardımcı olur:
 
@@ -8,6 +8,8 @@ Script; özellikle aşağıdaki işlerde yardımcı olur:
 - Yeni partition oluşturma
 - Bağımsız partition büyütme
 - LVM zincir büyütme
+- Partition tabanlı ve whole-disk LVM PV büyütme
+- Hypervisor/SAN üzerinde önceden büyütülmüş PV alanını otomatik algılama
 - Mount ve `fstab` yönetimi
 - Disk ve partition sağlık özetleri alma
 - Partition table yedekleme ve geri yükleme
@@ -38,7 +40,7 @@ Bu araç doğrudan block device üzerinde çalıştığı için dikkatli kullan�
 ## Bilinçli Sınırlar
 
 - Otomatik partition create/grow yalnızca diskin sonundaki boş alanla çalışır.
-- LVM zincir büyütmede seçilen PV bir partition olmalıdır.
+- LVM PV bir partition veya doğrudan disk (`whole-disk PV`) olabilir.
 - RAID, `mdadm`, `multipath`, `btrfs`, `zfs` ve karmaşık `crypt` topolojileri desteklenmez.
 - Loopback selftest fiziksel diski birebir taklit etmez; temel block-device/filesystem/mount akışını güvenli biçimde doğrular.
 
@@ -151,6 +153,7 @@ Opsiyonlar:
 - `--structure normal|lvm` (`normal` = bağımsız partition)
 - `--vg-name vg_data`
 - `--lv-name lv_data`
+- `--pv /dev/sda3` (çoklu-PV VG'lerde büyütülecek PV'yi seçer)
 - `--backup-file /var/backups/safepart/<file>.sfdisk`
 
 ## CLI Örnekleri
@@ -198,6 +201,40 @@ sudo ./safepart.sh --action grow-lvm \
   --size-gb 500 \
   --yes
 ```
+
+Bir VG içinde birden fazla PV varsa non-interactive kullanımda hedef PV açıkça belirtilmelidir:
+
+```bash
+sudo ./safepart.sh --action grow-lvm \
+  --target /dev/mapper/rl-root \
+  --pv /dev/sda3 \
+  --size-gb 200 \
+  --yes
+```
+
+Whole-disk PV örneği:
+
+```bash
+sudo ./safepart.sh --action grow-lvm \
+  --target /dev/mapper/vg_data-lv_data \
+  --pv /dev/sdb \
+  --size-gb 800 \
+  --yes
+```
+
+## Disk Büyütme Akışı
+
+RHEL/Rocky Linux üzerinde tipik sıralama şöyledir:
+
+1. Hypervisor, SAN veya bulut panelinde disk kapasitesi artırılır.
+2. İşletim sisteminin yeni kapasiteyi gördüğü doğrulanır (`lsblk`, `blockdev --getsize64`).
+3. Partition tabanlı PV ise partition büyütülür; GPT'nin eski secondary header bilgisi gerektiğinde `parted -f` ile düzeltilir.
+4. Whole-disk PV veya önceden büyütülmüş partition üzerinde `pvresize` uygulanır.
+5. LV ve ardından ext4/XFS filesystem büyütülür.
+
+Script kernel yeni partition boyutunu gerçekten görmediyse filesystem veya PV büyütmeye devam etmez. Bu durumda güvenli biçimde durur ve reboot sonrasında işlemin yeniden çalıştırılmasını ister.
+
+> “Unix tabanlı” kapsam burada Linux dağıtımlarını ifade eder. LVM2, `lsblk`, `partx` ve Linux block-device arayüzlerine dayandığı için macOS, FreeBSD, AIX, Solaris/illumos gibi farklı disk yönetim modelleri otomatik olarak desteklenmez.
 
 Disk sağlık özeti:
 
@@ -271,6 +308,44 @@ Bu test tipik olarak şunları doğrular:
 - Cleanup
 
 Bazı sistemlerde loop device üzerinde gerçek partition table uygulaması uyumsuz davranabilir. Bu durumda selftest taşınabilir fallback modunda çalışır ve raw loop device üstünde filesystem/mount/yazma yolunu test eder.
+
+## Unit Testleri (`tests/unit.sh`)
+
+[`tests/unit.sh`](tests/unit.sh), disk büyütme mantığında daha önce düzeltilmiş hataların sonraki kod değişiklikleriyle yeniden oluşmasını önleyen hızlı regresyon testidir. Uygulamanın normal çalışması için zorunlu değildir; geliştirme ve katkı kontrolü amacıyla repoda tutulur.
+
+Test sırasında gerçek disk, partition, LVM veya filesystem üzerinde işlem yapılmaz. `sfdisk`, `blockdev`, `lsblk` ve LVM sorguları kontrollü test fonksiyonlarıyla taklit edilir. Bu nedenle test root yetkisi istemez ve geliştirici bilgisayarında güvenle çalıştırılabilir.
+
+Mevcut testler şunları doğrular:
+
+- Büyütülmüş GPT diskte eski `last-lba` değerinin yeni kapasiteyi gizlememesi
+- DOS/MBR yapısında 32-bit LBA sınırının aşılmaması
+- Doğrudan diskin whole-disk LVM PV olarak seçilebilmesi
+- Block device büyütüldüğünde LVM PV'nin henüz kullanmadığı alanın doğru hesaplanması
+
+Testi repository kök dizininden çalıştırmak için:
+
+```bash
+bash tests/unit.sh
+```
+
+Başarılı çalışmada aşağıdakine benzer bir çıktı görülür:
+
+```text
+ok - GPT growth ignores stale last-lba
+ok - MBR growth respects 32-bit LBA limit
+ok - whole-disk PV is selectable
+ok - expanded block device exposes unclaimed PV bytes
+4 passed, 0 failed
+```
+
+Testin özellikle şu durumlarda çalıştırılması önerilir:
+
+- `safepart.sh` içindeki disk, partition veya LVM fonksiyonları değiştirildiğinde
+- Yeni Linux dağıtımı veya yeni disk topolojisi desteği eklendiğinde
+- Commit ya da pull request göndermeden önce
+- Bir disk büyütme hatası düzeltildikten sonra regresyon kontrolü için
+
+Unit testleri yalnızca izole edilmiş karar ve hesaplama mantığını doğrular. Loop device üzerindeki bütünleşik akışı test etmek için ayrıca `sudo ./safepart.sh --action selftest` kullanılmalıdır. Üretim öncesinde ise hedef dağıtımla aynı yapıya sahip bir test VM'i üzerinde dry-run ve kabul testi yapılması önerilir.
 
 ## Log ve Yedek Dizinleri
 
